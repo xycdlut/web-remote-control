@@ -1,0 +1,14 @@
+# 被控机 Agent 运行依赖
+#
+# 安装（务必加 --only-binary=:all:，否则 pip 可能尝试从源码编译 av 而失败）：
+#   .venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
+#
+# 版本已锁定为在 Windows + Python 3.9 上实测可用的组合。
+
+av==14.2.0            # 提供 h264_nvenc (NVIDIA 硬件编码)
+aiortc==1.13.0        # WebRTC 服务端
+aiohttp==3.13.5       # 本地 Web / 信令服务
+numpy<2               # dxcam 需要
+mss==10.2.0           # 备用截屏（DXGI 不可用时）
+dxcam==0.0.5          # DXGI Desktop Duplication 高速截屏
+cryptography>=44.0.0  # 安全随机 / 令牌

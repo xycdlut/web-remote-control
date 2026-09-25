@@ -1,0 +1,23 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# 本机私有配置（含密码哈希与令牌密钥）
+agent/config.json
+
+# frp 客户端配置（含令牌）与日志
+frp/
+
+# 便携程序 / 证书
+tools/
+certs/
+
+# 运行日志
+logs/
+*.log
+*.out
+*.err
