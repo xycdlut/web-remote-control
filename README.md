@@ -36,10 +36,8 @@
 ## 一、被控机部署
 
 ```powershell
-# 1) 首次：创建虚拟环境并安装依赖（约几分钟）
-powershell -ExecutionPolicy Bypass -File scripts\start_agent.ps1
-
-# 2) 设置访问密码（默认 admin，务必修改）
+# 1) 环境、依赖、frpc 均由首次运行 scripts\start_all.ps1 自动准备（见第三、四节）
+# 2) 设置访问密码（默认 admin，务必修改；需环境已建好）
 C:\path\to\python-env\python.exe agent\main.py --set-password 你的强密码
 ```
 
@@ -70,8 +68,8 @@ C:\path\to\python-env\python.exe agent\main.py --set-password 你的强密码
 ## 三、被控机连接服务器
 
 ```powershell
-# 首次会自动下载 frpc，然后连接并把本地 8443 穿透到服务器
-powershell -ExecutionPolicy Bypass -File scripts\start_frpc.ps1 -ServerAddr <云服务器IP> -Token <FRP令牌>
+# 首次运行会自动创建环境、安装依赖、下载 frpc，然后连接并把本地 8443 穿透到服务器
+powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1 -ServerAddr <云服务器IP> -Token <FRP令牌>
 ```
 
 ## 四、日常启动 / 开机自启
@@ -79,8 +77,8 @@ powershell -ExecutionPolicy Bypass -File scripts\start_frpc.ps1 -ServerAddr <云
 被控机每次开机（登录）后只需启动 **Agent + frpc** 两件事：
 
 ```powershell
-# 手动一键启动（都后台隐藏运行，日志在 logs\）
-powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
+# 手动一键启动（都后台隐藏运行，日志在 logs\）；首次会自动建环境/装依赖/下载 frpc
+powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1 -ServerAddr <云服务器IP> -Token <FRP令牌>
 ```
 
 **开机自启**（管理员运行一次，注册计划任务，登录后自动拉起 Agent+frpc）：
@@ -153,9 +151,9 @@ agent/           被控机 Agent
   config.py      配置读写 / 密码哈希
   config.json    运行配置（含密钥，勿外传，已 gitignore）
 web/             主控端浏览器界面（app.js / index.html / style.css / h264worker.js）
-scripts/         start_all / install_autostart / start_frpc / start_agent / restart_agent
+scripts/         start_all（首次自动建环境/装依赖/下载 frpc）/ install_autostart / restart_agent
 重启Agent.cmd     双击一键重启 Agent（自动 UAC 提权）
-vps/             install.sh（frps+Caddy）、install_turn.sh（coturn 中继）、setup_ssl.sh（备用）
+vps/             install.sh（frps+Caddy）、install_turn.sh（coturn 中继）
 frp/             frpc.toml（含令牌，已 gitignore）
 tools/           frpc.exe 等便携程序（已 gitignore）
 logs/            运行日志（自动生成）
@@ -211,3 +209,4 @@ TURN 中继的媒体全部经云服务器转发，带宽有限（实测约 **2 M
 
 - **v84**：工具栏新增「码率」下拉（2/4/8/16 Mbps），**直连与中继都生效**；修复本地快捷键在“先按功能键再补 Ctrl+Alt / 长按重复 / 同机注入回声”下误触发全屏；中继稳定性改进（编码码率上限、GOP=`fps×4`、REMB 抖动不再频繁重建 NVENC、中继改用浏览器自适应抖动缓冲、无画面看门狗放宽）；新增 `scripts/restart_agent.ps1` 与根目录 `重启Agent.cmd` 一键重启；清理 JPEG 兜底与无用代码。
 - **v80 及以前**：WebRTC 直连/中继 + H.264 over WS 硬解码双模式、coturn 中继、frp+Caddy 部署脚本、WebCodecs Worker 解码。
+- **脚本精简**：`start_all.ps1` 合并了原 `start_agent.ps1`（建环境/装依赖）与 `start_frpc.ps1`（下载 frpc）的首次逻辑；这两个脚本及仅备用的 `setup_ssl.sh` 已删除。
