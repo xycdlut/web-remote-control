@@ -49,6 +49,14 @@ def main(argv=None):
 
     cfg = config_mod.load()
 
+    # Windows 下提高定时器分辨率（默认 ~15.6ms），避免 asyncio.sleep 被放大导致发送帧率偏低
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
     if args.set_password:
         cfg["password_hash"] = config_mod.hash_password(args.set_password)
         cfg.pop("password", None)

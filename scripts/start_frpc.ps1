@@ -1,4 +1,4 @@
-# 被控机：启动 frpc，把本地 Agent(8443) 通过国内服务器中转出去
+﻿# 被控机：启动 frpc，把本地 Agent(8443) 通过国内服务器中转出去
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\start_frpc.ps1 `

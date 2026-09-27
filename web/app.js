@@ -1,6 +1,10 @@
-﻿"use strict";
+"use strict";
 
 /* global RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, VideoDecoder, EncodedVideoChunk */
+
+// 用 Worker + OffscreenCanvas 解码渲染（不可用时回退到主线程）
+const USE_WORKER_DECODE = typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined" &&
+  typeof HTMLCanvasElement !== "undefined" && !!HTMLCanvasElement.prototype.transferControlToOffscreen;
 
 const $ = (id) => document.getElementById(id);
 
@@ -15,18 +19,20 @@ const els = {
   stage: $("stage"),
   video: $("video"),
   canvas: $("canvas"),
-  cursorLayer: $("cursorLayer"),
   placeholder: $("placeholder"),
 
   status: $("status"),
+  lat: $("lat"),
   stats: $("stats"),
   diag: $("diag"),
   qualitySel: $("qualitySel"),
-  localCursorChk: $("localCursorChk"),
-  fallbackBtn: $("fallbackBtn"),
+  bitrateSel: $("bitrateSel"),
+  modeSel: $("modeSel"),
+  relayChk: $("relayChk"),
   keyboardBtn: $("keyboardBtn"),
   disconnectBtn: $("disconnectBtn"),
   toast: $("toast"),
+  build: $("build"),
 };
 
 window.onerror = (msg, src, line, col) => {
@@ -45,7 +51,6 @@ const state = {
   dc: null,
   mode: "webrtc",
   connected: false,
-  lastBitmap: null,
   pendingMove: null,
   moveScheduled: false,
   bytesLast: 0,
@@ -60,29 +65,31 @@ const state = {
   fallbackCodec: "h264",
   decoder: null,
   decoderConfig: null,
-  decTimestamp: 0,
-  h264: null,
   h264StartedAt: 0,
   h264Codec: "",
   needKey: true,
   rxCount: 0,
-  rxMsgs: 0,
-  rxJpeg: 0,
-  rxDec: 0,
-  rxOut: 0,
   rtt: -1,
   pingSent: 0,
   inputPingSent: 0,
   lastError: "",
-  baseCanvas: null,
-  baseCtx: null,
   baseW: 0,
   baseH: 0,
-  mouseX: 0,
-  mouseY: 0,
-  mouseVisible: false,
-  localCursor: true,
   hwDecode: false,
+  fullscreen: false,
+  desktopCombo: false,
+  lastKey: "",
+  decodeLatency: 0,
+  worker: null,
+  workerH264: false,
+  forceRelay: false,
+  jbProc: 0,
+  offsetUs: null,
+  pingSentEpoch: 0,
+  e2e: null,
+  lastSubmitAt: 0,
+  vfcToken: 0,
+  setupToken: 0,
 };
 
 /* ----------------------------- 工具 ----------------------------- */
@@ -107,7 +114,7 @@ function b64ToBytes(b64) {
 
 function fallbackMsg(codec) {
   const w = parseInt(els.qualitySel ? els.qualitySel.value : "1024", 10) || 1024;
-  return JSON.stringify({ type: "fallback", on: true, quality: 45, codec, w });
+  return JSON.stringify({ type: "fallback", on: true, codec, w });
 }
 
 function wsUrl() {
@@ -115,7 +122,21 @@ function wsUrl() {
   return proto + location.host + "/ws?token=" + encodeURIComponent(state.token);
 }
 
+/* ----------------------------- 时钟偏移 ----------------------------- */
+// 用 ping/pong 估计「服务端时钟 - 客户端时钟」(µs)，用于计算真实端到端延迟
+function updateClockOffset(serverMs) {
+  if (!serverMs || !state.pingSentEpoch) return;
+  const now = Date.now();
+  const rtt = now - state.pingSentEpoch;
+  state.offsetUs = Math.round(((serverMs + rtt / 2) - now) * 1000);
+  if (state.worker) {
+    try { state.worker.postMessage({ type: "offset", us: state.offsetUs }); } catch (_) {}
+  }
+}
+
 /* ----------------------------- 登录 ----------------------------- */
+// 鼠标进入查看器时尽量把键盘焦点拉回本窗口（多显示器下常丢焦点）
+if (els.viewer) els.viewer.addEventListener("mouseenter", () => { try { window.focus(); } catch (_) {} });
 els.loginForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   els.connectBtn.disabled = true;
@@ -146,11 +167,12 @@ async function start() {
   els.login.classList.add("hidden");
   els.viewer.classList.remove("hidden");
   setStatus("连接中…", "warn");
+  syncModeSelect();
 
   openWebSocket();
   openInputSocket();
   await setupWebRTC();
-  tryFullscreenAndLock();
+  try { window.focus(); els.stage.focus(); } catch (_) {}
 }
 
 function openWebSocket() {
@@ -158,7 +180,6 @@ function openWebSocket() {
   ws.binaryType = "arraybuffer";
   state.ws = ws;
   ws.onmessage = onSignalingMessage;
-  ws.onopen = () => setLocalCursor(els.localCursorChk.checked, true);
   ws.onerror = () => setStatus("信令错误", "err");
   ws.onclose = () => {
     if (state.ws === ws) state.ws = null;
@@ -180,6 +201,7 @@ function openInputSocket() {
       if (m.type === "pong" && state.inputPingSent) {
         state.rtt = Math.round(performance.now() - state.inputPingSent);
       }
+      if (m.type === "pong" && m.s) updateClockOffset(m.s);
     } catch (_) {}
   };
   ws.onclose = () => {
@@ -197,7 +219,6 @@ function reconnectWebSocket() {
   state.ws = ws;
   ws.onmessage = onSignalingMessage;
   ws.onopen = () => {
-    setLocalCursor(els.localCursorChk.checked, true);
     if (state.mode === "fallback") ws.send(fallbackMsg(state.fallbackCodec));
   };
   ws.onclose = () => {
@@ -211,12 +232,7 @@ function reconnectWebSocket() {
 
 async function onSignalingMessage(event) {
   if (typeof event.data !== "string") {
-    state.rxMsgs += 1;
-    if (state.fallbackCodec === "h264") {
-      if (state.decoder) decodeH264(event.data);
-    } else {
-      renderJpeg(event.data);
-    }
+    if (state.decoder || state.workerH264) decodeH264(event.data);
     return;
   }
   let msg;
@@ -232,48 +248,109 @@ async function onSignalingMessage(event) {
       toast("设置远端描述失败：" + err.message, 5000);
       enableFallback("媒体协商失败，已切换兼容模式");
     }
-  } else if (msg.type === "ready") {
-    // 服务端就绪
   } else if (msg.type === "h264") {
     setupH264(msg);
+  } else if (msg.type === "candidate") {
+    if (state.pc && msg.candidate) {
+      try { await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (_) {}
+    }
   } else if (msg.type === "pong") {
     if (state.pingSent) state.rtt = Math.round(performance.now() - state.pingSent);
+    if (msg.s) updateClockOffset(msg.s);
   }
 }
 
 /* ----------------------------- WebRTC ----------------------------- */
-async function setupWebRTC() {
+function closePeer() {
+  if (state.dc) { try { state.dc.close(); } catch (_) {} state.dc = null; }
+  if (state.pc) { try { state.pc.close(); } catch (_) {} state.pc = null; }
+  state.vfcToken++;  // 停止旧的 rVFC 回调循环
+  if (els.video) { try { els.video.srcObject = null; } catch (_) {} }
+}
+
+// 反复压低接收端播放/抖动缓冲（仅直连有效；中继抖动大，强制 0 会导致解码器卡死）
+function tuneReceiver() {
+  if (!state.pc || state.forceRelay) return;
+  try {
+    state.pc.getReceivers().forEach((r) => {
+      if ("jitterBufferTarget" in r) r.jitterBufferTarget = 0;
+      if ("playoutDelayHint" in r) r.playoutDelayHint = 0;
+    });
+  } catch (_) {}
+}
+
+function hasTurnServer(iceServers) {
+  try {
+    return (iceServers || []).some((s) => {
+      const u = s.urls;
+      const arr = Array.isArray(u) ? u : [u];
+      return arr.some((x) => typeof x === "string" && /^turns?:/i.test(x));
+    });
+  } catch (_) { return false; }
+}
+
+function sendBitrate() {
+  if (!state.ws || state.ws.readyState !== 1) return;
+  let bps = 8000000;
+  if (els.bitrateSel) { const v = parseInt(els.bitrateSel.value, 10); if (v) bps = v; }
+  try {
+    state.ws.send(JSON.stringify({ type: "bitrate", bps, max: bps }));
+  } catch (_) {}
+}
+
+async function setupWebRTC(opts) {
+  opts = opts || {};
   const cfg = state.config || {};
   const iceServers = (cfg.ice_servers && cfg.ice_servers.length)
     ? cfg.ice_servers
     : [{ urls: "stun:stun.l.google.com:19302" }];
 
-  const pc = new RTCPeerConnection({ iceServers });
+  if (state.pc) { try { state.pc.close(); } catch (_) {} state.pc = null; }
+  if (state.switchTimer) { clearTimeout(state.switchTimer); state.switchTimer = null; }
+  state.forceRelay = !!opts.forceRelay;
+  updateModeControls();
+
+  const rtcConfig = { iceServers };
+  if (opts.forceRelay) rtcConfig.iceTransportPolicy = "relay";
+
+  const pc = new RTCPeerConnection(rtcConfig);
   state.pc = pc;
   state.webrtcStartAt = performance.now();
 
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate && state.ws && state.ws.readyState === 1) {
+      try { state.ws.send(JSON.stringify({ type: "candidate", candidate: ev.candidate.toJSON() })); } catch (_) {}
+    }
+  };
+
   pc.addTransceiver("video", { direction: "recvonly" });
+  tuneReceiver();
 
   const dc = pc.createDataChannel("ctrl", { ordered: true });
   state.dc = dc;
   dc.onopen = () => {
+    if (state.pc !== pc) return;
     state.mode = "webrtc";
-    els.fallbackBtn.classList.remove("active");
+    syncModeSelect();
     setConnected(true);
+    if (state.forceRelay) setStatus("已连接(中继)", "ok");
   };
 
   pc.ontrack = (ev) => {
-    if (state.mode === "fallback") return;
+    if (state.pc !== pc || state.mode === "fallback") return;
     els.video.srcObject = ev.streams[0];
     els.video.play().catch(() => {});
     els.video.classList.remove("hidden");
     els.canvas.classList.add("hidden");
     els.placeholder.classList.add("hidden");
     state.mode = "webrtc";
-    els.fallbackBtn.classList.remove("active");
+    syncModeSelect();
+    tuneReceiver();
     const v = els.video;
     if (v.requestVideoFrameCallback) {
+      const token = ++state.vfcToken;
       const cb = () => {
+        if (state.vfcToken !== token) return;  // 已被新连接取代，停止旧循环
         state.lastFrameAt = performance.now();
         if (!state.connected) setConnected(true);
         if (state.switchTimer) { clearTimeout(state.switchTimer); state.switchTimer = null; }
@@ -284,8 +361,9 @@ async function setupWebRTC() {
   };
 
   pc.onconnectionstatechange = () => {
+    if (state.pc !== pc) return;
     const s = pc.connectionState;
-    if (s === "connected") setStatus("已连接", "ok");
+    if (s === "connected") { setStatus(state.forceRelay ? "已连接(中继)" : "已连接", "ok"); tuneReceiver(); sendBitrate(); }
     else if (s === "connecting") setStatus("连接中…", "warn");
     else if (s === "failed") setStatus("直连失败", "err");
   };
@@ -294,7 +372,9 @@ async function setupWebRTC() {
   await pc.setLocalDescription(offer);
   await waitIceGathering(pc, 2500);
 
+  const myToken = ++state.setupToken;
   const send = () => {
+    if (state.setupToken !== myToken) return;  // 已有更新的 setup，停止重试
     if (state.ws && state.ws.readyState === 1) {
       state.ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
     } else {
@@ -303,9 +383,18 @@ async function setupWebRTC() {
   };
   send();
 
+  // 中继：降码率并设上限，避免浏览器 REMB 把码率重新拉高冲垮中继链路；非中继恢复默认
+  sendBitrate();
+
   state.switchTimer = setTimeout(() => {
-    if (!state.connected) enableFallback("未能建立 P2P，已切换兼容模式");
-  }, 5000);
+    if (state.connected || state.pc !== pc) return;
+    if (!opts.forceRelay && hasTurnServer(iceServers)) {
+      toast("P2P 打洞失败，改用 TURN 中继");
+      setupWebRTC({ forceRelay: true });
+    } else {
+      enableFallback("未能建立 WebRTC（含中继），已切换兼容模式");
+    }
+  }, opts.forceRelay ? 8000 : 5000);
 }
 
 function waitIceGathering(pc, timeout) {
@@ -334,21 +423,16 @@ function setConnected(v) {
   }
   if (v) {
     setStatus(state.mode === "fallback"
-      ? (state.fallbackCodec === "h264" ? "兼容模式(硬解)" : "兼容模式(JPEG)")
-      : "已连接", state.mode === "fallback" ? "warn" : "ok");
+      ? "兼容模式(硬解)"
+      : (state.forceRelay ? "已连接(中继)" : "已连接"), state.mode === "fallback" ? "warn" : "ok");
   }
 }
 
 /* ----------------------------- 兼容模式 ----------------------------- */
-function supportsH264() {
-  return typeof VideoDecoder !== "undefined" && typeof EncodedVideoChunk !== "undefined";
-}
-
-function enableFallback(msg) {
-  if (state.mode === "fallback") return;
+function enableFallback(msg, codec) {
   state.mode = "fallback";
-  els.fallbackBtn.classList.add("active");
-  state.fallbackCodec = supportsH264() ? "h264" : "jpeg";
+  state.fallbackCodec = codec || "h264";
+  syncModeSelect();
   const sendFallback = (tries) => {
     if (state.ws && state.ws.readyState === 1) {
       state.ws.send(fallbackMsg(state.fallbackCodec));
@@ -363,30 +447,22 @@ function enableFallback(msg) {
   setConnected(true);
 }
 
-function switchToJpeg() {
-  state.fallbackCodec = "jpeg";
-  teardownDecoder();
-  if (state.ws && state.ws.readyState === 1) state.ws.send(fallbackMsg("jpeg"));
-}
-
 function teardownDecoder() {
   if (state.decoder) {
     try { state.decoder.close(); } catch (_) {}
     state.decoder = null;
   }
+  stopH264Worker();
 }
 
 function setupH264(msg) {
   teardownDecoder();
   state.fallbackCodec = "h264";
-  state.h264 = { width: msg.width, height: msg.height, fps: msg.fps || 20 };
+  syncModeSelect();
   state.lastFrameAt = performance.now();
   state.h264StartedAt = performance.now();
   els.video.classList.add("hidden");
-  els.canvas.classList.remove("hidden");
   els.placeholder.classList.add("hidden");
-  if (!canvasCtx) canvasCtx = els.canvas.getContext("2d");
-  state.decTimestamp = 0;
 
   const config = {
     codec: msg.codec || "avc1.42E01E",
@@ -397,14 +473,86 @@ function setupH264(msg) {
   state.decoderConfig = config;
   state.h264Codec = config.codec;
 
+  if (USE_WORKER_DECODE && startH264Worker(config)) {
+    probeHwDecode(config);
+    return;
+  }
+  els.canvas.classList.remove("hidden");
+  if (!canvasCtx) canvasCtx = els.canvas.getContext("2d");
   if (!ensureDecoder()) {
-    toast("H.264 配置失败，改用 JPEG：" + (state.lastError || ""), 5000);
-    switchToJpeg();
+    toast("H.264 配置失败：" + (state.lastError || ""), 5000);
     return;
   }
   setStatus("兼容模式(硬解)", "warn");
   probeHwDecode(config);
 }
+
+/* ---------- Worker 解码路径 ---------- */
+function onWorkerMessage(e) {
+  const m = e.data;
+  if (!m) return;
+  if (m.type === "frame") {
+    if (m.changed) { state.baseW = m.w; state.baseH = m.h; }
+    state.lastFrameAt = performance.now();
+    if (m.e2e != null) state.e2e = m.e2e;
+    state.rxFrames += 1;
+  } else if (m.type === "needkey") {
+    state.needKey = true;
+  } else if (m.type === "clock") {
+    state.workerClock = { msOfDay: m.msOfDay, t: m.t };
+  } else if (m.type === "error") {
+    state.lastError = "worker:" + m.message;
+  }
+}
+
+function sizeH264Worker() {
+  const el = els.h264canvas;
+  if (!el || !state.worker) return;
+  const w = el.clientWidth, h = el.clientHeight;
+  if (w && h) state.worker.postMessage({ type: "size", w, h, dpr: window.devicePixelRatio || 1 });
+}
+
+function startH264Worker(config) {
+  try {
+    stopH264Worker();
+    const el = document.createElement("canvas");
+    el.id = "h264canvas";
+    el.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;background:#000;";
+    els.stage.appendChild(el);
+    els.h264canvas = el;
+    els.canvas.classList.add("hidden");
+    els.video.classList.add("hidden");
+    const off = el.transferControlToOffscreen();
+    const worker = new Worker("h264worker.js?v=84");
+    state.worker = worker;
+    worker.onmessage = onWorkerMessage;
+    worker.postMessage({ type: "canvas", canvas: off }, [off]);
+    worker.postMessage({ type: "size", w: el.clientWidth, h: el.clientHeight, dpr: window.devicePixelRatio || 1 });
+    worker.postMessage({ type: "config", codec: config.codec, description: config.description || null });
+    worker.postMessage({ type: "offset", us: state.offsetUs || 0 });
+    state.workerH264 = true;
+    state.needKey = true;
+    setStatus("兼容模式(硬解·W)", "warn");
+    return true;
+  } catch (e) {
+    state.lastError = "worker启动失败:" + e.message;
+    stopH264Worker();
+    return false;
+  }
+}
+
+function stopH264Worker() {
+  if (state.worker) {
+    try { state.worker.postMessage({ type: "close" }); } catch (_) {}
+    try { state.worker.terminate(); } catch (_) {}
+    state.worker = null;
+  }
+  state.workerH264 = false;
+  if (els.h264canvas && els.h264canvas.parentNode) els.h264canvas.parentNode.removeChild(els.h264canvas);
+  els.h264canvas = null;
+}
+
+window.addEventListener("resize", () => { if (state.workerH264) sizeH264Worker(); });
 
 async function probeHwDecode(config) {
   try {
@@ -424,7 +572,10 @@ function ensureDecoder() {
   try {
     state.decoder = new VideoDecoder({
       output: (frame) => {
-        state.rxOut += 1;
+        state.decodeLatency = Math.round(performance.now() - state.lastSubmitAt);
+        if (state.offsetUs != null) {
+          state.e2e = Math.round((Date.now() * 1000 + state.offsetUs - frame.timestamp) / 1000);
+        }
         drawVideoFrame(frame);
         frame.close();
       },
@@ -441,11 +592,25 @@ function ensureDecoder() {
 }
 
 function decodeH264(buffer) {
-  if (!ensureDecoder()) return;
   const u8 = new Uint8Array(buffer);
-  if (u8.length < 2) return;
+  if (u8.length < 10) return;  // 1 字节标志 + 8 字节采集时间戳 + 负载
   const isKey = u8[0] === 1;
+  const tsUs = Number(new DataView(buffer).getBigUint64(1));  // 服务端采集时间(epoch µs)
+  const data = u8.subarray(9);
 
+  if (state.workerH264 && state.worker) {
+    if (state.needKey && !isKey) return;
+    if (isKey) state.needKey = false;
+    const chunk = data.slice();
+    state.rxCount += 1;
+    state.rxBytes += u8.byteLength;
+    try {
+      state.worker.postMessage({ type: "chunk", key: isKey, ts: tsUs, data: chunk }, [chunk.buffer]);
+    } catch (_) {}
+    return;
+  }
+
+  if (!ensureDecoder()) return;
   if (state.decoder.decodeQueueSize > 12) {
     try { state.decoder.close(); } catch (_) {}
     state.decoder = null;
@@ -455,14 +620,11 @@ function decodeH264(buffer) {
   if (state.needKey && !isKey) return;
   if (isKey) state.needKey = false;
 
-  const data = u8.subarray(1);
-  const ts = state.decTimestamp;
-  state.decTimestamp += Math.round(1e6 / (state.h264 ? state.h264.fps : 20));
+  state.lastSubmitAt = performance.now();
   try {
-    state.decoder.decode(new EncodedVideoChunk({ type: isKey ? "key" : "delta", timestamp: ts, data }));
+    state.decoder.decode(new EncodedVideoChunk({ type: isKey ? "key" : "delta", timestamp: tsUs, data }));
     state.rxFrames += 1;
     state.rxCount += 1;
-    state.rxDec += 1;
     state.rxBytes += u8.byteLength;
     state.lastFrameAt = performance.now();
   } catch (e) {
@@ -475,81 +637,22 @@ function drawVideoFrame(frame) {
   try {
     const fw = frame.displayWidth || frame.codedWidth;
     const fh = frame.displayHeight || frame.codedHeight;
-    ensureBase(fw, fh);
-    state.baseCtx.drawImage(frame, 0, 0, fw, fh);
-    renderComposite();
+    state.baseW = fw;
+    state.baseH = fh;
+    // 直接绘制到显示画布（避免中间画布的整帧拷贝，降低主线程负担）
+    drawScaled(frame, fw, fh);
     state.lastError = "";
   } catch (e) {
     state.lastError = "draw:" + e.message;
   }
 }
 
-function disableFallback() {
-  state.mode = "webrtc";
-  els.fallbackBtn.classList.remove("active");
-  teardownDecoder();
-  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "fallback", on: false }));
-  els.canvas.classList.add("hidden");
-  els.video.classList.remove("hidden");
-  state.lastBitmap = null;
-}
-
-/* ----------------------------- JPEG 渲染 ----------------------------- */
+/* ----------------------------- 兼容模式画布 ----------------------------- */
 let canvasCtx = null;
 
-async function renderJpeg(buffer) {
-  els.video.classList.add("hidden");
-  els.canvas.classList.remove("hidden");
-  els.placeholder.classList.add("hidden");
-  state.lastFrameAt = performance.now();
-  state.rxFrames += 1;
-  state.rxJpeg += 1;
-  state.rxBytes += (buffer.byteLength || buffer.length || 0);
-  try {
-    const blob = new Blob([buffer], { type: "image/jpeg" });
-    const bmp = await createImageBitmap(blob);
-    state.lastBitmap = bmp;
-    ensureBase(bmp.width, bmp.height);
-    state.baseCtx.drawImage(bmp, 0, 0);
-    renderComposite();
-    state.lastError = "";
-  } catch (e) {
-    state.lastError = "jpeg:" + e.message;
-  }
-}
-
-/* ----------------------------- 本地光标（画在主画布上，保证可见） ----------------------------- */
-const CURSOR_SHAPE = [[0, 0], [0, 19], [4, 15], [7, 22], [11, 20], [8, 13], [14, 13]];
-
-function ensureBase(w, h) {
-  if (!state.baseCanvas) {
-    state.baseCanvas = document.createElement("canvas");
-    state.baseCtx = null;
-  }
-  if (state.baseCanvas.width !== w || state.baseCanvas.height !== h) {
-    state.baseCanvas.width = w;
-    state.baseCanvas.height = h;
-    state.baseCtx = null;
-  }
-  if (!state.baseCtx) state.baseCtx = state.baseCanvas.getContext("2d");
-  state.baseW = w;
-  state.baseH = h;
-}
-
-function drawArrow(ctx, x, y) {
-  ctx.beginPath();
-  CURSOR_SHAPE.forEach((p, i) => (i ? ctx.lineTo(x + p[0], y + p[1]) : ctx.moveTo(x + p[0], y + p[1])));
-  ctx.closePath();
-  ctx.fillStyle = "#fff";
-  ctx.strokeStyle = "#000";
-  ctx.lineWidth = 1;
-  ctx.fill();
-  ctx.stroke();
-}
-
-function renderComposite() {
+function drawScaled(source, sw, sh) {
   const canvas = els.canvas;
-  if (!state.baseCanvas || !state.baseW) return;
+  if (!sw || !sh) return;
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
@@ -563,34 +666,20 @@ function renderComposite() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, w, h);
-  const scale = Math.min(w / state.baseW, h / state.baseH);
-  const dw = state.baseW * scale, dh = state.baseH * scale;
-  const dx = (w - dw) / 2, dy = (h - dh) / 2;
-  ctx.drawImage(state.baseCanvas, dx, dy, dw, dh);
-  if (state.localCursor && state.mouseVisible) {
-    const r = canvas.getBoundingClientRect();
-    drawArrow(ctx, state.mouseX - r.left, state.mouseY - r.top);
-  }
+  const scale = Math.min(w / sw, h / sh);
+  const dw = sw * scale, dh = sh * scale;
+  ctx.drawImage(source, (w - dw) / 2, (h - dh) / 2, dw, dh);
 }
 
-function setLocalCursor(on, notify = false) {
-  state.localCursor = !!on;
-  if (notify && state.ws && state.ws.readyState === 1) {
-    state.ws.send(JSON.stringify({ type: "cursor", on: !state.localCursor }));
-  }
-  if (state.mode === "fallback") renderComposite();
-}
-
-/* ----------------------------- 输入映射 ----------------------------- */
 function activeMedia() {
-  return state.mode === "fallback" ? els.canvas : els.video;
+  if (state.mode === "fallback") return (state.workerH264 && els.h264canvas) ? els.h264canvas : els.canvas;
+  return els.video;
 }
 
 function intrinsicSize() {
   if (state.mode === "fallback") {
     if (state.baseW) return { w: state.baseW, h: state.baseH };
-    const b = state.lastBitmap;
-    return b ? { w: b.width, h: b.height } : null;
+    return null;
   }
   const v = els.video;
   if (!v.videoWidth) return null;
@@ -630,10 +719,6 @@ function normalized(e) {
 }
 
 els.stage.addEventListener("mousemove", (e) => {
-  state.mouseX = e.clientX;
-  state.mouseY = e.clientY;
-  state.mouseVisible = true;
-  if (state.mode === "fallback") renderComposite();
   if (!state.connected) return;
   state.pendingMove = normalized(e);
   if (!state.moveScheduled) {
@@ -646,11 +731,6 @@ els.stage.addEventListener("mousemove", (e) => {
       }
     });
   }
-});
-
-els.stage.addEventListener("mouseleave", () => {
-  state.mouseVisible = false;
-  if (state.mode === "fallback") renderComposite();
 });
 
 els.stage.addEventListener("mousedown", (e) => {
@@ -685,64 +765,245 @@ function isTyping(el) {
   return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
 }
 
+function isFullscreen() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+// 是否把该按键转发给被控机：非全屏时不接管 Win 等系统快捷键，交回本机系统
+function shouldForwardKey(e) {
+  if (!state.connected || isTyping(e.target)) return false;
+  if (!state.fullscreen && e.metaKey) return false;
+  return true;
+}
+
+// 引导键命令模式：先按 ` 再按功能键（普通按键，不受输入法/组合键拦截影响）
+let shortcutMode = false;
+let shortcutTimer = null;
+// 当前物理按下的按键：用于识别长按重复/重复派发，避免“先按功能键再补 Ctrl+Alt”误触发
+const downCodes = new Set();
+// 最近转发给被控机的时间戳：同机测试时 Agent 注入的按键会“回声”回本页面，
+// 这些回放事件不应再当作本地快捷键（否则 Ctrl+Alt 按下后回放的 F 会误触发全屏）
+const recentlyForwarded = new Map();
+
+function toggleRelay() {
+  if (!els.relayChk) return;
+  els.relayChk.checked = !els.relayChk.checked;
+  els.relayChk.dispatchEvent(new Event("change"));
+}
+
+function handleShortcutMode(e, dup) {
+  if (!state.token || dup) return false;  // dup：重复事件不作为命令
+  if (!e.ctrlKey && !e.altKey && !e.metaKey && e.code === "Backquote") {
+    shortcutMode = true;
+    clearTimeout(shortcutTimer);
+    shortcutTimer = setTimeout(() => { shortcutMode = false; }, 3000);
+    toast("命令模式：1/2/3 画质 · M 模式 · F 全屏 · R 中继 · Q 断开");
+    return true;
+  }
+  if (!shortcutMode) return false;
+  shortcutMode = false;
+  clearTimeout(shortcutTimer);
+  const code = e.code || "";
+  const key = (e.key && e.key.length === 1) ? e.key.toLowerCase() : "";
+  if (code === "Digit1" || code === "Numpad1" || key === "1") { applyQuality(1024); return true; }
+  if (code === "Digit2" || code === "Numpad2" || key === "2") { applyQuality(1440); return true; }
+  if (code === "Digit3" || code === "Numpad3" || key === "3") { applyQuality(1920); return true; }
+  if (code === "KeyM" || key === "m") { cycleMode(); return true; }
+  if (code === "KeyF" || key === "f") { tryFullscreenAndLock(); return true; }
+  if (code === "KeyR" || key === "r") { toggleRelay(); return true; }
+  if (code === "KeyQ" || key === "q") { location.reload(); return true; }
+  return false;
+}
+
+// 主控端本地快捷键（Ctrl+Alt+…）：始终在转发给被控机之前拦截
+function handleLocalShortcut(e, dup) {
+  // dup：长按重复或重复派发；此时若再按下 Ctrl+Alt 会带上当前修饰键状态，
+  // 造成“先按 F 再补 Ctrl+Alt 也触发”。必须要求 Ctrl+Alt 先按下的首次 keydown。
+  if (!state.token || dup || !e.ctrlKey || !e.altKey) return false;
+  // 刚刚才转发给被控机的同一按键（同机回声）不算本地快捷键
+  const fwd = recentlyForwarded.get(e.code);
+  if (fwd && performance.now() - fwd < 500) return false;
+  const code = e.code || "";
+  const key = (e.key && e.key.length === 1) ? e.key.toLowerCase() : "";
+  if (code === "Digit1" || code === "Numpad1" || key === "1") { applyQuality(1024); return true; }
+  if (code === "Digit2" || code === "Numpad2" || key === "2") { applyQuality(1440); return true; }
+  if (code === "Digit3" || code === "Numpad3" || key === "3") { applyQuality(1920); return true; }
+  if (code === "KeyM" || key === "m") { cycleMode(); return true; }
+  if (code === "KeyF" || key === "f") { tryFullscreenAndLock(); return true; }
+  if (code === "KeyR" || key === "r") { toggleRelay(); return true; }
+  if (code === "KeyQ" || key === "q") { location.reload(); return true; }
+  return false;
+}
+
 window.addEventListener("keydown", (e) => {
-  if (!state.connected || isTyping(e.target)) return;
-  if (e.metaKey && !e.ctrlKey) return;
+  state.lastKey = "C" + (e.ctrlKey ? 1 : 0) + "A" + (e.altKey ? 1 : 0) + "S" + (e.shiftKey ? 1 : 0) + " " + (e.code || e.key);
+  const dup = downCodes.has(e.code);
+  downCodes.add(e.code);
+  if (handleShortcutMode(e, dup)) { e.preventDefault(); return; }
+  if (handleLocalShortcut(e, dup)) { e.preventDefault(); return; }
+  if (!shouldForwardKey(e)) return;
+  // 自定义快捷键：Ctrl+D -> 被控机 Win+D（显示桌面）
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyD") {
+    if (!dup) {
+      sendInput({ t: "k", c: "ControlLeft", d: 0 });  // 清掉此前已下发的 Ctrl
+      sendInput({ t: "k", c: "MetaLeft", d: 1 });
+      sendInput({ t: "k", c: "KeyD", d: 1 });
+      state.desktopCombo = true;
+    }
+    e.preventDefault();
+    return;
+  }
   sendInput({ t: "k", c: e.code, k: e.key.length === 1 ? e.key : undefined, d: 1 });
+  recentlyForwarded.set(e.code, performance.now());
   e.preventDefault();
 }, true);
 
 window.addEventListener("keyup", (e) => {
-  if (!state.connected || isTyping(e.target)) return;
+  downCodes.delete(e.code);
+  if (state.desktopCombo && e.code === "KeyD") {
+    sendInput({ t: "k", c: "KeyD", d: 0 });
+    sendInput({ t: "k", c: "MetaLeft", d: 0 });
+    state.desktopCombo = false;
+    e.preventDefault();
+    return;
+  }
+  if (!shouldForwardKey(e)) return;
   sendInput({ t: "k", c: e.code, k: e.key.length === 1 ? e.key : undefined, d: 0 });
   e.preventDefault();
 }, true);
 
+// 失焦时清空按键状态，避免按键“卡住”导致后续误判
+window.addEventListener("blur", () => downCodes.clear());
+
 /* ----------------------------- 全屏 / 键盘锁定 ----------------------------- */
-async function tryFullscreenAndLock() {
+// 全屏时用 Keyboard Lock 捕获系统按键（Win、Alt+Tab、Esc 等），转发给被控机
+const LOCK_KEYS = [
+  "Escape", "Tab", "ContextMenu",
+  "MetaLeft", "MetaRight", "AltLeft", "AltRight",
+  "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+];
+
+async function lockKeyboard() {
   try {
-    if (!document.fullscreenElement && els.viewer.requestFullscreen) {
-      await els.viewer.requestFullscreen();
-    }
-  } catch (_) {}
-  try {
-    if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock();
+    if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock(LOCK_KEYS);
   } catch (_) {}
 }
 
-els.keyboardBtn.addEventListener("click", tryFullscreenAndLock);
+function unlockKeyboard() {
+  try {
+    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+  } catch (_) {}
+}
 
-/* ----------------------------- 兼容模式按钮：切换 H.264/JPEG ----------------------------- */
-els.fallbackBtn.addEventListener("click", () => {
-  if (state.mode !== "fallback") {
-    enableFallback("已开启兼容模式");
+async function tryFullscreenAndLock() {
+  if (isFullscreen()) {
+    try { await document.exitFullscreen(); } catch (_) {}
     return;
   }
-  if (state.fallbackCodec === "h264") {
-    toast("切换到 JPEG 模式");
-    switchToJpeg();
-  } else {
-    toast("切换到 H.264 硬解");
-    state.fallbackCodec = "h264";
-    teardownDecoder();
-    state.needKey = true;
-    if (state.ws && state.ws.readyState === 1) state.ws.send(fallbackMsg("h264"));
+  try {
+    if (els.viewer.requestFullscreen) await els.viewer.requestFullscreen();
+  } catch (_) {}
+  state.fullscreen = isFullscreen();
+  if (state.fullscreen) {
+    await lockKeyboard();
+    toast("已全屏：Win / Alt+Tab 等系统快捷键将转发给被控机");
   }
+}
+
+document.addEventListener("fullscreenchange", () => {
+  state.fullscreen = isFullscreen();
+  if (state.fullscreen) lockKeyboard();
+  else unlockKeyboard();
 });
+
+els.keyboardBtn.addEventListener("click", tryFullscreenAndLock);
+
+/* ----------------------------- 模式：直连 / 硬解码 ----------------------------- */
+function currentMode() {
+  return state.mode === "fallback" ? state.fallbackCodec : "webrtc";
+}
+
+function updateModeControls() {
+  const fb = state.mode === "fallback";
+  if (els.qualitySel) els.qualitySel.style.display = fb ? "" : "none";
+  if (els.bitrateSel) els.bitrateSel.style.display = fb ? "none" : "";
+  if (els.relayChk) {
+    const label = els.relayChk.closest(".chk");
+    if (label) label.style.display = fb ? "none" : "";
+  }
+}
+
+function syncModeSelect() {
+  if (!els.modeSel) return;
+  const v = currentMode();
+  if (els.modeSel.value !== v) els.modeSel.value = v;
+  updateModeControls();
+}
+
+function setMode(target) {
+  if (target === currentMode()) { syncModeSelect(); return; }
+  if (target === "webrtc") {
+    state.mode = "webrtc";
+    teardownDecoder();
+    if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "fallback", on: false }));
+    els.canvas.classList.add("hidden");
+    els.video.classList.remove("hidden");
+    if (state.pc) { try { state.pc.close(); } catch (_) {} state.pc = null; }
+    setupWebRTC({ forceRelay: !!(els.relayChk && els.relayChk.checked) });
+    toast("切换到直连（WebRTC）");
+    return;
+  }
+  teardownDecoder();
+  closePeer();
+  state.needKey = true;
+  enableFallback("已切换到硬解码(H.264)", "h264");
+}
+
+function cycleMode() {
+  const order = ["webrtc", "h264"];
+  setMode(order[(order.indexOf(currentMode()) + 1) % order.length]);
+}
+
+els.modeSel.addEventListener("change", () => setMode(els.modeSel.value));
+
+/* ----------------------------- 强制中继 ----------------------------- */
+if (els.relayChk) {
+  els.relayChk.addEventListener("change", () => {
+    state.forceRelay = els.relayChk.checked;
+    toast(state.forceRelay ? "强制 TURN 中继" : "优先直连（失败自动中继）");
+    state.mode = "webrtc";
+    teardownDecoder();
+    if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "fallback", on: false }));
+    els.canvas.classList.add("hidden");
+    els.video.classList.remove("hidden");
+    setupWebRTC({ forceRelay: state.forceRelay });
+  });
+}
+
+/* ----------------------------- 直连码率 ----------------------------- */
+if (els.bitrateSel) {
+  try {
+    const saved = localStorage.getItem("rc_direct_bitrate");
+    if (saved && Array.prototype.some.call(els.bitrateSel.options, (o) => o.value === saved)) els.bitrateSel.value = saved;
+  } catch (_) {}
+  els.bitrateSel.addEventListener("change", () => {
+    try { localStorage.setItem("rc_direct_bitrate", els.bitrateSel.value); } catch (_) {}
+    if (state.mode === "webrtc") sendBitrate();
+    const opt = els.bitrateSel.options[els.bitrateSel.selectedIndex];
+    toast((state.forceRelay ? "中继码率：" : "直连码率：") + (opt ? opt.textContent : els.bitrateSel.value));
+  });
+}
 
 /* ----------------------------- 画质档位 ----------------------------- */
-els.qualitySel.addEventListener("change", () => {
+function applyQuality(width) {
+  if (width) els.qualitySel.value = String(width);
   if (state.mode === "fallback" && state.ws && state.ws.readyState === 1) {
     state.ws.send(fallbackMsg(state.fallbackCodec));
-    toast("已切换画质档位");
   }
-});
-
-/* ----------------------------- 本地光标开关 ----------------------------- */
-els.localCursorChk.addEventListener("change", () => {
-  setLocalCursor(els.localCursorChk.checked, true);
-  toast(els.localCursorChk.checked ? "已启用本地即时光标" : "已切回被控机真实光标");
-});
+  const opt = els.qualitySel.options[els.qualitySel.selectedIndex];
+  toast("画质：" + (opt ? opt.textContent : els.qualitySel.value));
+}
+els.qualitySel.addEventListener("change", () => applyQuality());
 
 els.disconnectBtn.addEventListener("click", () => location.reload());
 
@@ -760,7 +1021,7 @@ setInterval(() => {
   }
   if (state.mode !== "webrtc") return;
   const ref = state.lastFrameAt || state.webrtcStartAt;
-  if (ref && performance.now() - ref > 6000) {
+  if (ref && performance.now() - ref > 10000) {
     enableFallback("WebRTC 无画面，已自动切换兼容模式");
   }
 }, 2000);
@@ -783,11 +1044,14 @@ setInterval(() => {
   } else {
     state.pingSent = performance.now();
   }
-  ws.send(JSON.stringify({ type: "ping" }));
+  const tEpoch = Date.now();
+  state.pingSentEpoch = tEpoch;
+  ws.send(JSON.stringify({ type: "ping", t: tEpoch }));
 }, 2000);
 
 /* ----------------------------- 状态统计 ----------------------------- */
 setInterval(async () => {
+  if (state.pc) tuneReceiver();
   const rx = state.rxFrames;
   const rxBytes = state.rxBytes;
   state.rxFrames = 0;
@@ -809,6 +1073,9 @@ setInterval(async () => {
           }
           state.bytesLast = r.bytesReceived;
           state.bytesTime = now;
+          const jb = r.jitterBufferEmittedCount ? 1000 * r.jitterBufferDelay / r.jitterBufferEmittedCount : 0;
+          const proc = r.framesDecoded ? 1000 * (r.totalProcessingDelay || 0) / r.framesDecoded : 0;
+          state.jbProc = jb + proc;
           text = `${fps} fps · ${(bitrate / 1e6).toFixed(1)} Mbps`;
         }
       });
@@ -820,12 +1087,23 @@ setInterval(async () => {
 
 /* ----------------------------- 诊断条 ----------------------------- */
 setInterval(() => {
+  if (els.build) els.build.textContent = "v84";
   if (!els.diag) return;
   const age = state.lastFrameAt ? ((performance.now() - state.lastFrameAt) / 1000).toFixed(1) : "-";
+  let lat = 0;
+  if (state.mode === "fallback") {
+    // 真实端到端（服务端采集时间戳 → 客户端显示）
+    if (state.e2e != null) { lat = state.e2e; if (els.lat) els.lat.textContent = "端到端:" + lat + "ms"; }
+    else if (els.lat) { els.lat.textContent = "端到端:…"; }
+  } else {
+    // WebRTC 无自定义时间戳，展示接收管线延迟（jb+proc）+ RTT/2
+    lat = Math.round((state.jbProc || 0) + (state.rtt > 0 ? state.rtt / 2 : 0));
+    if (els.lat) els.lat.textContent = "接收:" + lat + "ms";
+  }
   els.diag.textContent =
-    `模式:${state.mode}/${state.fallbackCodec} 帧龄:${age}s 收:${state.rxMsgs} J:${state.rxJpeg} 提交:${state.rxDec} 出:${state.rxOut}` +
-    ` ws:${state.ws ? state.ws.readyState : "-"} in:${state.inputWs ? state.inputWs.readyState : "-"}` +
-    ` RTT:${state.rtt < 0 ? "-" : state.rtt + "ms"}` +
+    `模式:${state.mode}${state.mode === "fallback" ? "/" + state.fallbackCodec : ""} RTT:${state.rtt < 0 ? "-" : state.rtt + "ms"} 帧龄:${age}s` +
+    ` 键:${state.lastKey || "-"}` +
     (state.h264Codec ? ` ${state.h264Codec}${state.hwDecode ? "(硬解)" : "(软解)"}` : "") +
+    (state.mode === "fallback" && state.fallbackCodec === "h264" ? ` 解码:${state.decodeLatency}ms` : "") +
     (state.lastError ? ` ERR:${state.lastError}` : "");
 }, 1500);

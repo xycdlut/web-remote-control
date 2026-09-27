@@ -15,10 +15,8 @@ def _b64d(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def create_token(secret: str, ttl: int, extra: dict = None) -> str:
+def create_token(secret: str, ttl: int) -> str:
     payload = {"exp": int(time.time()) + int(ttl), "n": _b64e(secrets.token_bytes(8))}
-    if extra:
-        payload.update(extra)
     body = _b64e(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = _b64e(hmac.new(secret.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
     return body + "." + sig

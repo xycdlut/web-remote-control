@@ -1,4 +1,4 @@
-# 注册计划任务：登录后自动运行 start_all.ps1（Agent + frpc），以最高权限、隐藏窗口
+﻿# 注册计划任务：登录后自动运行 start_all.ps1（Agent + frpc），以最高权限、隐藏窗口
 # 需以【管理员】运行。
 #
 # 用法：
@@ -7,11 +7,14 @@
 # 卸载：
 #   Unregister-ScheduledTask -TaskName RemoteControlAgent -Confirm:$false
 param(
-    [string]$ServerAddr = "YOUR_SERVER_IP",
-    [string]$Token = "YOUR_FRP_TOKEN"
+    [string]$ServerAddr = "",
+    [string]$Token = ""
 )
 
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($ServerAddr) -or [string]::IsNullOrWhiteSpace($Token)) {
+    throw "请提供 -ServerAddr <服务器IP> 与 -Token <FRP令牌>"
+}
 $root = Split-Path -Parent $PSScriptRoot
 $script = Join-Path $root "scripts\start_all.ps1"
 $argStr = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -ServerAddr $ServerAddr -Token $Token"

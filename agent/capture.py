@@ -164,8 +164,7 @@ class ScreenCapture:
         self.width = int(mon["width"])
         self.height = int(mon["height"])
         self._backend = "mss"
-        self._mss_thread = threading.Thread(target=self._mss_loop, daemon=True)
-        self._mss_thread.start()
+        threading.Thread(target=self._mss_loop, daemon=True).start()
 
     def _mss_loop(self):
         period = 1.0 / max(1, self.fps)

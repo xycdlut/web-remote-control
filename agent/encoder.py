@@ -8,11 +8,10 @@ import logging
 import av
 
 from aiortc.codecs.h264 import H264Encoder
-from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
 
 logger = logging.getLogger(__name__)
 
-SETTINGS = {"fps": 30, "bitrate": 8_000_000}
+SETTINGS = {"fps": 30, "bitrate": 8_000_000, "max_bitrate": 50_000_000}
 
 
 def configure(fps: int = None, bitrate: int = None):
@@ -34,10 +33,10 @@ def _new_codec(frame, name, fps, bitrate, width=None, height=None):
     if name == "h264_nvenc":
         codec.options = {"preset": "p1", "tune": "ull", "rc": "cbr",
                          "zerolatency": "1", "delay": "0", "bf": "0",
-                         "g": str(max(1, fps * 2))}
+                         "g": str(max(1, fps * 4))}
     else:
         codec.options = {"tune": "zerolatency", "preset": "ultrafast",
-                         "g": str(max(1, fps * 2))}
+                         "g": str(max(1, fps * 4))}
     return codec
 
 
@@ -52,6 +51,7 @@ class NvencH264Encoder(H264Encoder):
         super().__init__()
         self.fps = int(fps or SETTINGS["fps"])
         self._target_bitrate = int(bitrate or SETTINGS["bitrate"])
+        self._max_bitrate = int(SETTINGS.get("max_bitrate", 50_000_000))
         self._codec_name = "h264_nvenc"
         self.codec = None
         if not _logged_once:
@@ -64,13 +64,14 @@ class NvencH264Encoder(H264Encoder):
 
     @target_bitrate.setter
     def target_bitrate(self, value: int) -> None:
-        self._target_bitrate = max(300_000, min(int(value), 50_000_000))
+        # REMB from the browser can ramp this up; never exceed the configured cap.
+        self._target_bitrate = max(300_000, min(int(value), self._max_bitrate))
 
     def _encode_frame(self, frame, force_keyframe):
         if self.codec is not None and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
-            or abs(self._target_bitrate - self.codec.bit_rate) / max(1, self.codec.bit_rate) > 0.1
+            or abs(self._target_bitrate - self.codec.bit_rate) / max(1, self.codec.bit_rate) > 0.4
         ):
             self.codec = None
 
@@ -126,7 +127,8 @@ class AnnexBEncoder:
         c.max_b_frames = 0
         if self._codec_name == "h264_nvenc":
             c.options = {"preset": "p1", "tune": "ull", "rc": "cbr", "zerolatency": "1",
-                         "delay": "0", "bf": "0", "g": str(max(1, self.fps * 2))}
+                         "delay": "0", "bf": "0",
+                         "g": str(max(1, self.fps * 2))}
         else:
             c.options = {"tune": "zerolatency", "preset": "ultrafast",
                          "g": str(max(1, self.fps * 2))}
@@ -181,12 +183,32 @@ class AnnexBEncoder:
 
 
 _original_get_encoder = None
+_last_encoder = None
 
 
 def _patched_get_encoder(codec):
+    global _last_encoder
     if codec.mimeType.lower() == "video/h264":
-        return NvencH264Encoder()
+        _last_encoder = NvencH264Encoder()
+        return _last_encoder
     return _original_get_encoder(codec)
+
+
+def set_target_bitrate(bps: int, max_bps=None) -> None:
+    """运行时调整 WebRTC 视频编码码率（中继降码率用）。
+    max_bps 同时设为上限，防止浏览器 REMB 把码率重新拉高导致中继链路拥塞。"""
+    bps = max(300_000, min(int(bps), 50_000_000))
+    SETTINGS["bitrate"] = bps
+    if max_bps:
+        SETTINGS["max_bitrate"] = max(300_000, min(int(max_bps), 50_000_000))
+    enc = _last_encoder
+    if enc is not None:
+        try:
+            if max_bps:
+                enc._max_bitrate = SETTINGS["max_bitrate"]
+            enc.target_bitrate = bps
+        except Exception:
+            pass
 
 
 def apply_codec_preference(transceiver) -> None:

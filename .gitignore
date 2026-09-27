@@ -21,3 +21,9 @@ logs/
 *.log
 *.out
 *.err
+
+# 本地开发/测试脚手架
+node_modules/
+.vscode/
+package.json
+package-lock.json

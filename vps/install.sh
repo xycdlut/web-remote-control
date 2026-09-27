@@ -4,7 +4,7 @@
 # 用法（在服务器上执行）：
 #   bash install.sh <域名> <frp令牌>
 # 例：
-#   bash install.sh rdp.example.com YOUR_FRP_TOKEN
+#   bash install.sh remote.example.com MyFrpToken
 #
 # 前置：
 #   1. Cloudflare 添加 A 记录 <域名> -> 本服务器公网IP （灰云/DNS only）
@@ -110,7 +110,7 @@ echo "--- caddy ---"; systemctl --no-pager --full status caddy | head -6 || true
 
 echo ""
 echo "完成。"
-echo "  frp 服务器IP : $(curl -s --max-time 8 https://api.ipify.org || echo 'YOUR_SERVER_IP')"
+echo "  frp 服务器IP : $(curl -s --max-time 8 https://api.ipify.org || echo '<服务器公网IP>')"
 echo "  frp 端口     : 7000"
 echo "  frp 令牌     : ${TOKEN}"
 echo "  主控机访问   : https://${DOMAIN}"

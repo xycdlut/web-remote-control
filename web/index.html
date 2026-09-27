@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>远程控制</title>
-<link rel="stylesheet" href="style.css?v=36" />
+<link rel="stylesheet" href="style.css?v=84" />
 </head>
 <body>
   <!-- 登录 -->
@@ -15,40 +15,50 @@
       <input id="password" type="password" placeholder="访问密码" autocomplete="current-password" required />
       <button id="connectBtn" type="submit">连接</button>
       <p id="loginError" class="error"></p>
-      <p class="hint">连接后请按提示进入全屏，以锁定键盘。</p>
+      <p class="hint">命令模式：先按 <b>`</b> 再按 1/2/3 画质、M 模式、F 全屏、R 中继、Q 断开<br />也可用 Ctrl+Alt+1/2/3/M/F/R/Q；快捷键需先点击本页面使其获得焦点</p>
     </form>
   </div>
 
   <!-- 查看器 -->
   <div id="viewer" class="hidden">
-    <div id="stage" tabindex="0">
-      <video id="video" autoplay playsinline muted></video>
-      <canvas id="canvas" class="hidden"></canvas>
-      <canvas id="cursorLayer"></canvas>
-      <div id="placeholder">等待画面…</div>
-    </div>
-
     <div id="toolbar">
+      <span id="build" class="pill">v84</span>
       <span id="status" class="pill">连接中…</span>
+      <span id="lat" class="pill"></span>
       <span id="stats" class="pill"></span>
       <span id="diag" class="pill"></span>
       <span class="spacer"></span>
-      <label class="chk" title="本地即时光标：光标跟手，但看不到被控机真实光标形状">
-        <input type="checkbox" id="localCursorChk" checked /> 本地光标
-      </label>
-      <select id="qualitySel" title="画质档位（越高越吃 CPU，无独显机器建议流畅/均衡）">
-        <option value="1024">流畅 1024×576</option>
-        <option value="1440">均衡 1440×810</option>
-        <option value="1920" selected>高清 1920×1080</option>
+      <select id="modeSel" title="模式：直连 / 硬解码(H.264)（Ctrl+Alt+M 切换）">
+        <option value="webrtc">直连</option>
+        <option value="h264">硬解码</option>
       </select>
-      <button id="fallbackBtn" title="兼容模式：优先 H.264 硬解，失败则 JPEG">兼容模式</button>
-      <button id="keyboardBtn" title="全屏并锁定键盘">全屏锁定</button>
-      <button id="disconnectBtn">断开</button>
+      <select id="qualitySel" title="画质档位（仅硬解码模式；Ctrl+Alt+1/2/3）">
+        <option value="1024">流畅 1024×576 · Ctrl+Alt+1</option>
+        <option value="1440">均衡 1440×810 · Ctrl+Alt+2</option>
+        <option value="1920" selected>高清 1920×1080 · Ctrl+Alt+3</option>
+      </select>
+      <select id="bitrateSel" title="码率（WebRTC：直连/中继）">
+        <option value="2000000">2 Mbps</option>
+        <option value="4000000">4 Mbps</option>
+        <option value="8000000" selected>8 Mbps</option>
+        <option value="16000000">16 Mbps</option>
+      </select>
+      <label class="chk" title="强制通过 TURN 中继（仅直连模式；Ctrl+Alt+R）">
+        <input type="checkbox" id="relayChk" /> 强制中继
+      </label>
+      <button id="keyboardBtn" title="进入/退出全屏并锁定键盘（Ctrl+Alt+F）">全屏锁定 · Ctrl+Alt+F</button>
+      <button id="disconnectBtn" title="断开（Ctrl+Alt+Q）">断开 · Ctrl+Alt+Q</button>
+    </div>
+
+    <div id="stage" tabindex="0">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas" class="hidden"></canvas>
+      <div id="placeholder">等待画面…</div>
     </div>
 
     <div id="toast" class="hidden"></div>
   </div>
 
-  <script src="app.js?v=36"></script>
+  <script src="app.js?v=84"></script>
 </body>
 </html>

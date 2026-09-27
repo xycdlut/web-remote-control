@@ -1,12 +1,9 @@
 """WebRTC 视频轨：从 ScreenCapture 拉取 BGRA 帧交给 NVENC 编码。"""
 import asyncio
 import fractions
-import logging
 
 from av import VideoFrame
 from aiortc import MediaStreamTrack
-
-logger = logging.getLogger(__name__)
 
 
 class ScreenStreamTrack(MediaStreamTrack):

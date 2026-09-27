@@ -21,14 +21,10 @@ DEFAULTS = {
     "tls_key": None,
     "ice_servers": [
         {"urls": ["stun:stun.miwifi.com:3478"]},
-        {"urls": ["stun:stun.qq.com:3478"]},
         {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["turn:openrelay.metered.ca:80"],
-         "username": "openrelayproject", "credential": "openrelayproject"},
-        {"urls": ["turn:openrelay.metered.ca:443"],
-         "username": "openrelayproject", "credential": "openrelayproject"},
-        {"urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
-         "username": "openrelayproject", "credential": "openrelayproject"},
+        # 部署 coturn 后，按 vps/install_turn.sh 输出的 ice_servers 填写（域名/用户名/口令）
+        # {"urls": ["turn:<你的域名>:3478?transport=udp"], "username": "<用户名>", "credential": "<口令>"},
+        # {"urls": ["turn:<你的域名>:3478?transport=tcp"], "username": "<用户名>", "credential": "<口令>"},
     ],
     "token_secret": None,
 }

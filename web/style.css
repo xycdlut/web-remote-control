@@ -67,6 +67,9 @@ html, body {
 
 /* ---------- 查看器 ---------- */
 #viewer { position: fixed; inset: 0; display: flex; flex-direction: column; }
+/* 仅画面区隐藏系统箭头（改由被控机画面内的真实光标标识）；
+   工具栏等 UI 使用系统原生光标，保证多显示器/DPI 下精确可点 */
+#stage { cursor: none; }
 
 #stage {
   position: relative;
@@ -76,7 +79,6 @@ html, body {
   outline: none;
   cursor: default;
 }
-#stage.remote-cursor { cursor: none; }
 
 #video, #canvas {
   position: absolute;
@@ -87,15 +89,6 @@ html, body {
   display: block;
 }
 #video { background: #000; }
-
-#cursorLayer {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  z-index: 5;
-}
 
 #placeholder {
   position: absolute;
@@ -111,13 +104,15 @@ html, body {
 #toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 8px;
   padding: 8px 12px;
   background: #161b22;
-  border-top: 1px solid #30363d;
+  border-bottom: 1px solid #30363d;
 }
 
 .pill {
+  flex: 0 0 auto;
   padding: 4px 10px;
   border-radius: 20px;
   background: #21262d;
@@ -125,11 +120,22 @@ html, body {
   font-size: 12px;
   white-space: nowrap;
 }
+/* diag 可伸缩并按需截断，保证工具栏恒定一行，不把按钮挤到第二行 */
+#diag {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#toolbar > select,
+#toolbar > button,
+#toolbar > .chk { flex: 0 0 auto; }
 .pill.ok { color: #3fb950; }
 .pill.warn { color: #d29922; }
 .pill.err { color: #f85149; }
 
-.spacer { flex: 1; }
+.spacer { display: none; }
 
 #toolbar button {
   padding: 6px 12px;

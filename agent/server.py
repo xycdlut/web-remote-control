@@ -1,10 +1,11 @@
-﻿"""本地 Web 服务：静态页面 + 登录 + WebSocket 信令 + WebRTC + H.264/JPEG 兜底。"""
+﻿"""本地 Web 服务：静态页面 + 登录 + WebSocket 信令 + WebRTC + H.264 硬解码兜底。"""
 import asyncio
 import base64
 import json
 import logging
 import re
 import socket
+import struct
 import time
 
 import cv2
@@ -90,9 +91,7 @@ class ClientSession:
         self.injector = injector
         self.pc = None
         self.track = None
-        self.channel = None
         self._fallback_task = None
-        self._fallback_quality = 45
         self._fallback_gen = 0
         self._fallback_width = 1024
         self._closed = False
@@ -128,19 +127,23 @@ class ClientSession:
                     logger.debug("addIceCandidate failed: %s", e)
         elif mtype == "input":
             self._inject(data.get("ev") or {})
-        elif mtype == "cursor":
-            self.capture._cursor_overlay = bool(data.get("on", True))
         elif mtype == "rate":
             CLIENT_RATE["q"] = int(data.get("q", 0))
             CLIENT_RATE["rx"] = float(data.get("rx", 0))
             CLIENT_RATE["t"] = time.time()
         elif mtype == "fallback":
             if data.get("on"):
-                self._start_fallback(data.get("quality", 45), data.get("codec", "h264"), data.get("w", 1024))
+                self._start_fallback(data.get("w", 1024))
             else:
                 self._stop_fallback()
         elif mtype == "ping":
-            await self._send_json({"type": "pong", "t": data.get("t")})
+            await self._send_json({"type": "pong", "t": data.get("t"), "s": int(time.time() * 1000)})
+        elif mtype == "bitrate":
+            try:
+                encoder_mod.set_target_bitrate(int(data.get("bps", 0)), data.get("max"))
+                logger.info("target bitrate -> %s bps (max %s)", data.get("bps"), data.get("max"))
+            except Exception as e:
+                logger.warning("set bitrate failed: %s", e)
 
     async def _handle_offer(self, sdp):
         ice_servers = []
@@ -160,8 +163,6 @@ class ClientSession:
 
         @self.pc.on("datachannel")
         def on_datachannel(channel):
-            self.channel = channel
-
             @channel.on("message")
             def on_message(message):
                 if isinstance(message, str):
@@ -177,14 +178,27 @@ class ClientSession:
             if st in ("failed", "closed"):
                 await self._close_pc()
 
+        @self.pc.on("icecandidate")
+        async def on_icecandidate(candidate):
+            """把本地候选（含 TURN relay）逐条发给浏览器，否则后收集的中继候选会漏掉。"""
+            if candidate is None:
+                return
+            try:
+                await self._send_json({"type": "candidate", "candidate": {
+                    "candidate": candidate.candidate,
+                    "sdpMid": candidate.sdpMid,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                }})
+            except Exception:
+                pass
+
         await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
         answer = await self.pc.createAnswer()
         await self.pc.setLocalDescription(answer)
         await self._send_json({"type": "answer", "sdp": self.pc.localDescription.sdp})
 
     # ---------- 兜底 ----------
-    def _start_fallback(self, quality, codec="h264", width=1024):
-        self._fallback_quality = max(20, min(int(quality), 40))
+    def _start_fallback(self, width=1024):
         self._fallback_width = max(640, min(int(width), 1920))
         self._fallback_gen += 1
         CLIENT_RATE.update({"q": 0, "rx": 0.0, "t": 0.0})
@@ -193,11 +207,8 @@ class ClientSession:
             asyncio.ensure_future(self._close_pc())
         if self._fallback_task and not self._fallback_task.done():
             self._fallback_task.cancel()
-        if codec == "h264":
-            self._fallback_task = asyncio.ensure_future(self._h264_loop())
-        else:
-            self._fallback_task = asyncio.ensure_future(self._fallback_loop())
-        logger.info("fallback started codec=%s q=%s w=%s", codec, self._fallback_quality, self._fallback_width)
+        self._fallback_task = asyncio.ensure_future(self._h264_loop())
+        logger.info("fallback started w=%s", self._fallback_width)
 
     def _stop_fallback(self):
         self._fallback_gen += 1
@@ -224,20 +235,26 @@ class ClientSession:
         period = 1.0 / max(1, fps)
         loop = asyncio.get_event_loop()
         sent = dropped = nbytes = 0
+        cap_ms = enc_ms = 0.0
         stat_at = time.time()
         key_at = 0.0
         header_sent = False
         try:
             while not self._closed and self._fallback_gen == gen:
                 t0 = time.perf_counter()
+                _tc = time.perf_counter()
                 frame = await loop.run_in_executor(None, self.capture.get_frame)
+                cap_us = int(time.time() * 1_000_000)
+                cap_ms += (time.perf_counter() - _tc) * 1000.0
                 if frame is None:
                     await asyncio.sleep(period)
                     continue
                 if time.time() - key_at > 2.0:
                     enc.force_keyframe()
                     key_at = time.time()
+                _te = time.perf_counter()
                 data, _flag = await loop.run_in_executor(None, self._encode_h264, enc, frame, w, h)
+                enc_ms += (time.perf_counter() - _te) * 1000.0
                 nals = _annexb_nals(data) if data else []
                 if not nals:
                     await asyncio.sleep(period)
@@ -260,7 +277,7 @@ class ClientSession:
 
                 avcc = _avcc(nals)
                 if avcc and self._ws_backlog() < 64 * 1024:
-                    payload = (b"\x01" if is_key else b"\x00") + avcc
+                    payload = (b"\x01" if is_key else b"\x00") + struct.pack(">Q", cap_us) + avcc
                     try:
                         await self.ws.send_bytes(payload)
                         sent += 1
@@ -271,9 +288,11 @@ class ClientSession:
                     dropped += 1
                 now = time.time()
                 if now - stat_at >= 3.0:
-                    logger.info("h264: cap %dfps sent %.1ffps %.2fMbps drop %d rate %.2fMbps q=%d rx=%.1f",
-                                fps, sent / (now - stat_at), nbytes * 8 / (now - stat_at) / 1e6, dropped,
-                                enc.bitrate / 1e6, CLIENT_RATE["q"], CLIENT_RATE["rx"])
+                    n = max(1, sent + dropped)
+                    logger.info("h264: sent %.1ffps %.2fMbps drop %d | cap %.1fms enc %.1fms rate %.2fMbps q=%d rx=%.1f",
+                                sent / (now - stat_at), nbytes * 8 / (now - stat_at) / 1e6, dropped,
+                                cap_ms / n, enc_ms / n, enc.bitrate / 1e6, CLIENT_RATE["q"], CLIENT_RATE["rx"])
+                    cap_ms = enc_ms = 0.0
                     if now - CLIENT_RATE["t"] < 6:
                         if CLIENT_RATE["q"] > 4 or CLIENT_RATE["rx"] < fps * 0.6:
                             enc.set_bitrate(enc.bitrate * 0.7)
@@ -294,54 +313,6 @@ class ClientSession:
         if frame.shape[1] != w or frame.shape[0] != h:
             f = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
         return enc.encode(f)
-
-    async def _fallback_loop(self):
-        gen = self._fallback_gen
-        fps = min(int(self.capture.fps), 12)
-        period = 1.0 / max(1, fps)
-        loop = asyncio.get_event_loop()
-        sent = dropped = nbytes = 0
-        stat_at = time.time()
-        try:
-            while not self._closed and self._fallback_gen == gen:
-                t0 = time.perf_counter()
-                frame = await loop.run_in_executor(None, self.capture.get_frame)
-                if frame is not None and self._ws_backlog() < 64 * 1024:
-                    ok, buf = await loop.run_in_executor(None, self._encode_jpeg, frame)
-                    if ok and buf is not None:
-                        try:
-                            await self.ws.send_bytes(buf)
-                            sent += 1
-                            nbytes += len(buf)
-                        except (ConnectionError, RuntimeError):
-                            break
-                else:
-                    dropped += 1
-                now = time.time()
-                if now - stat_at >= 3.0:
-                    logger.info("fallback: cap %.0ffps sent %.1ffps %.1fMbps drop %d",
-                                fps, sent / (now - stat_at), nbytes * 8 / (now - stat_at) / 1e6, dropped)
-                    sent = dropped = nbytes = 0
-                    stat_at = now
-                dt = time.perf_counter() - t0
-                if dt < period:
-                    await asyncio.sleep(period - dt)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning("fallback loop stopped: %s", e)
-
-    def _encode_jpeg(self, frame):
-        try:
-            bgr = frame[:, :, :3]
-            h, w = bgr.shape[:2]
-            if w > 1280:
-                scale = 1280.0 / w
-                bgr = cv2.resize(bgr, (1280, int(h * scale)), interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self._fallback_quality])
-            return ok, buf.tobytes() if ok else None
-        except Exception:
-            return False, None
 
     # ---------- 输入 ----------
     def _inject(self, ev):
@@ -497,7 +468,7 @@ def create_app(cfg, capture, injector):
                     except Exception as e:
                         logger.debug("inject failed: %s", e)
                 elif t == "ping":
-                    await ws.send_json({"type": "pong"})
+                    await ws.send_json({"type": "pong", "s": int(time.time() * 1000)})
                 elif t == "rate":
                     CLIENT_RATE["q"] = int(data.get("q", 0))
                     CLIENT_RATE["rx"] = float(data.get("rx", 0))
