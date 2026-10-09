@@ -30,6 +30,16 @@ case "$PUBLIC_IP" in
         echo "检测到 PUBLIC_IP=${PUBLIC_IP} 是内网地址，请显式传入公网IP作为第4个参数"; exit 1;;
 esac
 
+# 云主机常见「私网IP + 公网EIP(NAT)」：external-ip 必须写 公网/私网 映射，
+# 否则 coturn 会把中继到自身(公网)判为非法，返回 403 Forbidden IP（中继不可用）。
+LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+[ -n "$LOCAL_IP" ] || LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+EXTERNAL_IP_CFG="$PUBLIC_IP"
+if [ -n "$LOCAL_IP" ] && [ "$LOCAL_IP" != "$PUBLIC_IP" ]; then
+    EXTERNAL_IP_CFG="${PUBLIC_IP}/${LOCAL_IP}"
+    echo "检测到私网IP ${LOCAL_IP}，external-ip 使用 ${EXTERNAL_IP_CFG}"
+fi
+
 echo "==> 安装 coturn"
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y coturn
@@ -61,7 +71,7 @@ cat > /etc/turnserver.conf <<EOF
 listening-port=3478
 tls-listening-port=5349
 listening-ip=0.0.0.0
-external-ip=${PUBLIC_IP}
+external-ip=${EXTERNAL_IP_CFG}
 min-port=${RELAY_MIN}
 max-port=${RELAY_MAX}
 fingerprint

@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>远程控制</title>
-<link rel="stylesheet" href="style.css?v=84" />
+<link rel="stylesheet" href="style.css?v=91" />
 </head>
 <body>
   <!-- 登录 -->
@@ -22,7 +22,7 @@
   <!-- 查看器 -->
   <div id="viewer" class="hidden">
     <div id="toolbar">
-      <span id="build" class="pill">v84</span>
+      <span id="build" class="pill">v91</span>
       <span id="status" class="pill">连接中…</span>
       <span id="lat" class="pill"></span>
       <span id="stats" class="pill"></span>
@@ -38,13 +38,13 @@
         <option value="1920" selected>高清 1920×1080 · Ctrl+Alt+3</option>
       </select>
       <select id="bitrateSel" title="码率（WebRTC：直连/中继）">
-        <option value="2000000">2 Mbps</option>
+        <option value="2000000" selected>2 Mbps</option>
         <option value="4000000">4 Mbps</option>
-        <option value="8000000" selected>8 Mbps</option>
+        <option value="8000000">8 Mbps</option>
         <option value="16000000">16 Mbps</option>
       </select>
-      <label class="chk" title="强制通过 TURN 中继（仅直连模式；Ctrl+Alt+R）">
-        <input type="checkbox" id="relayChk" /> 强制中继
+      <label class="chk" title="优先/强制通过 TURN 中继（默认开启）">
+        <input type="checkbox" id="relayChk" checked /> 强制中继
       </label>
       <button id="keyboardBtn" title="进入/退出全屏并锁定键盘（Ctrl+Alt+F）">全屏锁定 · Ctrl+Alt+F</button>
       <button id="disconnectBtn" title="断开（Ctrl+Alt+Q）">断开 · Ctrl+Alt+Q</button>
@@ -59,6 +59,6 @@
     <div id="toast" class="hidden"></div>
   </div>
 
-  <script src="app.js?v=84"></script>
+  <script src="app.js?v=91"></script>
 </body>
 </html>

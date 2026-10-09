@@ -91,6 +91,7 @@ class ClientSession:
         self.injector = injector
         self.pc = None
         self.track = None
+        self._track_params = {"max_w": 0, "max_h": 0, "fps": 0}
         self._fallback_task = None
         self._fallback_gen = 0
         self._fallback_width = 1024
@@ -106,6 +107,7 @@ class ClientSession:
                     continue
                 await self._on_message(data)
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                logger.info("信令 WS 结束: %s", msg.type)
                 break
         await self.close()
 
@@ -131,6 +133,12 @@ class ClientSession:
             CLIENT_RATE["q"] = int(data.get("q", 0))
             CLIENT_RATE["rx"] = float(data.get("rx", 0))
             CLIENT_RATE["t"] = time.time()
+        elif mtype == "log":
+            logger.info("client: %s", data.get("msg"))
+        elif mtype == "rxstat":
+            logger.info("client rx: frames=%s decoded=%s lost=%s bytesKB=%s",
+                        data.get("fr"), data.get("fd"), data.get("lost"),
+                        int((data.get("bytes") or 0) // 1024))
         elif mtype == "fallback":
             if data.get("on"):
                 self._start_fallback(data.get("w", 1024))
@@ -140,10 +148,12 @@ class ClientSession:
             await self._send_json({"type": "pong", "t": data.get("t"), "s": int(time.time() * 1000)})
         elif mtype == "bitrate":
             try:
-                encoder_mod.set_target_bitrate(int(data.get("bps", 0)), data.get("max"))
-                logger.info("target bitrate -> %s bps (max %s)", data.get("bps"), data.get("max"))
+                encoder_mod.set_target_bitrate(int(data.get("bps", 0)), data.get("max"), data.get("min"))
+                logger.info("target bitrate -> %s bps (min %s max %s)", data.get("bps"), data.get("min"), data.get("max"))
             except Exception as e:
                 logger.warning("set bitrate failed: %s", e)
+            if "relay" in data:
+                self._apply_relay_caps(bool(data.get("relay")))
 
     async def _handle_offer(self, sdp):
         ice_servers = []
@@ -154,8 +164,9 @@ class ClientSession:
                 credential=s.get("credential"),
             ))
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
-        self.track = ScreenStreamTrack(self.capture)
+        self.track = ScreenStreamTrack(self.capture, self._track_params)
         self.pc.addTrack(self.track)
+        asyncio.ensure_future(self._webrtc_stats_loop())
         try:
             encoder_mod.apply_codec_preference(self.pc.getTransceivers()[-1])
         except Exception as e:
@@ -178,6 +189,10 @@ class ClientSession:
             if st in ("failed", "closed"):
                 await self._close_pc()
 
+        @self.pc.on("iceconnectionstatechange")
+        async def on_ice_state():
+            logger.info("WebRTC ICE state: %s", self.pc.iceConnectionState if self.pc else "-")
+
         @self.pc.on("icecandidate")
         async def on_icecandidate(candidate):
             """把本地候选（含 TURN relay）逐条发给浏览器，否则后收集的中继候选会漏掉。"""
@@ -198,6 +213,14 @@ class ClientSession:
         await self._send_json({"type": "answer", "sdp": self.pc.localDescription.sdp})
 
     # ---------- 兜底 ----------
+    def _apply_relay_caps(self, relay):
+        """中继模式限制 WebRTC 输出分辨率/帧率：降低客户端解码压力、提升每像素比特。"""
+        if relay:
+            self._track_params.update({"max_w": 1920, "max_h": 1080, "fps": 30})
+        else:
+            self._track_params.update({"max_w": 0, "max_h": 0, "fps": 0})
+        logger.info("track caps -> %s", self._track_params)
+
     def _start_fallback(self, width=1024):
         self._fallback_width = max(640, min(int(width), 1920))
         self._fallback_gen += 1
@@ -313,6 +336,47 @@ class ClientSession:
         if frame.shape[1] != w or frame.shape[0] != h:
             f = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
         return enc.encode(f)
+
+    async def _webrtc_stats_loop(self):
+        """每 5s 打印 WebRTC 发送码率、选中候选对类型与连接状态，便于排查中继掉线。"""
+        last_sent = 0
+        while self.pc is not None and not self._closed:
+            try:
+                await asyncio.sleep(5)
+                pc = self.pc
+                if pc is None:
+                    break
+                stats = await pc.getStats()
+                sent = frames = 0
+                pair = None
+                for s in stats.values():
+                    t = getattr(s, "type", "")
+                    if t == "outbound-rtp" and getattr(s, "kind", "") == "video":
+                        sent = getattr(s, "bytesSent", 0)
+                        frames = getattr(s, "framesEncoded", 0)
+                    elif t == "candidate-pair" and (getattr(s, "selected", False)
+                                                    or getattr(s, "state", "") == "succeeded"
+                                                    or getattr(s, "nominated", False)):
+                        pair = s
+                local = remote = "-"
+                if pair is not None:
+                    for s in stats.values():
+                        if getattr(s, "id", "") == getattr(pair, "localCandidateId", ""):
+                            local = getattr(s, "candidateType", "?")
+                        if getattr(s, "id", "") == getattr(pair, "remoteCandidateId", ""):
+                            remote = getattr(s, "candidateType", "?")
+                mbps = (sent - last_sent) * 8 / 5 / 1e6 if last_sent else 0
+                last_sent = sent
+                enc = encoder_mod._last_encoder
+                tb = getattr(enc, "_target_bitrate", None) if enc else None
+                logger.info("webrtc: send=%.2fMbps target=%s totalKB=%d frames=%d pair=%s<->%s ice=%s conn=%s",
+                            mbps, tb, sent // 1024, frames, local, remote,
+                            pc.iceConnectionState, pc.connectionState)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("webrtc stats loop: %s", e)
+                break
 
     # ---------- 输入 ----------
     def _inject(self, ev):
@@ -432,6 +496,7 @@ def create_app(cfg, capture, injector):
 
         old = state.current
         if old is not None:
+            logger.info("新的信令连接到来，关闭旧会话")
             try:
                 await old.close()
             except Exception:
@@ -479,8 +544,8 @@ def create_app(cfg, capture, injector):
 
     app.router.add_get("/", index)
     app.router.add_post("/api/login", login)
-    app.router.add_get("/ws", ws_handler)
-    app.router.add_get("/ws-input", ws_input_handler)
+    app.router.add_get("/api/signal", ws_handler)
+    app.router.add_get("/api/signal-in", ws_input_handler)
     if WEB_DIR is not None:
         app.router.add_static("/", str(WEB_DIR), show_index=False)
     return app

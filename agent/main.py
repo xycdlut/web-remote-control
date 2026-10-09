@@ -20,6 +20,7 @@ import config as config_mod  # noqa: E402
 import encoder as encoder_mod  # noqa: E402
 from injector import Injector  # noqa: E402
 import server as server_mod  # noqa: E402
+import turnpatch  # noqa: E402
 
 
 def parse_args(argv):
@@ -79,6 +80,7 @@ def main(argv=None):
 
     encoder_mod.configure(cfg["fps"], cfg["bitrate"])
     encoder_mod.install_patch()
+    turnpatch.install()
 
     capture = ScreenCapture(monitor=cfg["monitor"], fps=cfg["fps"])
     capture.start()

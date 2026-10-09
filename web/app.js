@@ -90,6 +90,7 @@ const state = {
   lastSubmitAt: 0,
   vfcToken: 0,
   setupToken: 0,
+  webrtcStallRetries: 0,
 };
 
 /* ----------------------------- 工具 ----------------------------- */
@@ -119,7 +120,7 @@ function fallbackMsg(codec) {
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss://" : "ws://";
-  return proto + location.host + "/ws?token=" + encodeURIComponent(state.token);
+  return proto + location.host + "/api/signal?token=" + encodeURIComponent(state.token);
 }
 
 /* ----------------------------- 时钟偏移 ----------------------------- */
@@ -171,7 +172,8 @@ async function start() {
 
   openWebSocket();
   openInputSocket();
-  await setupWebRTC();
+  // 默认优先中继：按工具栏「强制中继」当前状态建立连接
+  await setupWebRTC({ forceRelay: !!(els.relayChk && els.relayChk.checked) });
   try { window.focus(); els.stage.focus(); } catch (_) {}
 }
 
@@ -192,7 +194,7 @@ function openWebSocket() {
 
 function openInputSocket() {
   const proto = location.protocol === "https:" ? "wss://" : "ws://";
-  const ws = new WebSocket(proto + location.host + "/ws-input?token=" + encodeURIComponent(state.token));
+  const ws = new WebSocket(proto + location.host + "/api/signal-in?token=" + encodeURIComponent(state.token));
   state.inputWs = ws;
   ws.onmessage = (ev) => {
     if (typeof ev.data !== "string") return;
@@ -289,12 +291,19 @@ function hasTurnServer(iceServers) {
   } catch (_) { return false; }
 }
 
-function sendBitrate() {
+function sendBitrate(softStart) {
   if (!state.ws || state.ws.readyState !== 1) return;
-  let bps = 8000000;
+  let bps = 2000000;
   if (els.bitrateSel) { const v = parseInt(els.bitrateSel.value, 10); if (v) bps = v; }
+  let start = bps, max = bps, min = 300000;
+  if (state.forceRelay) {
+    // 中继：设最低 1 Mbps 地板，避免 REMB 卡在低码率；并低码率软启动
+    max = bps;
+    min = 1000000;
+    start = softStart ? Math.min(bps, min) : bps;
+  }
   try {
-    state.ws.send(JSON.stringify({ type: "bitrate", bps, max: bps }));
+    state.ws.send(JSON.stringify({ type: "bitrate", bps: start, max, min, relay: state.forceRelay }));
   } catch (_) {}
 }
 
@@ -363,7 +372,7 @@ async function setupWebRTC(opts) {
   pc.onconnectionstatechange = () => {
     if (state.pc !== pc) return;
     const s = pc.connectionState;
-    if (s === "connected") { setStatus(state.forceRelay ? "已连接(中继)" : "已连接", "ok"); tuneReceiver(); sendBitrate(); }
+    if (s === "connected") { setStatus(state.forceRelay ? "已连接(中继)" : "已连接", "ok"); tuneReceiver(); }
     else if (s === "connecting") setStatus("连接中…", "warn");
     else if (s === "failed") setStatus("直连失败", "err");
   };
@@ -384,7 +393,7 @@ async function setupWebRTC(opts) {
   send();
 
   // 中继：降码率并设上限，避免浏览器 REMB 把码率重新拉高冲垮中继链路；非中继恢复默认
-  sendBitrate();
+  sendBitrate(true);
 
   state.switchTimer = setTimeout(() => {
     if (state.connected || state.pc !== pc) return;
@@ -417,6 +426,7 @@ function waitIceGathering(pc, timeout) {
 
 function setConnected(v) {
   state.connected = v;
+  if (v) state.webrtcStallRetries = 0;
   if (v && state.switchTimer) {
     clearTimeout(state.switchTimer);
     state.switchTimer = null;
@@ -430,6 +440,7 @@ function setConnected(v) {
 
 /* ----------------------------- 兼容模式 ----------------------------- */
 function enableFallback(msg, codec) {
+  sendLog("enableFallback: " + (msg || ""));
   state.mode = "fallback";
   state.fallbackCodec = codec || "h264";
   syncModeSelect();
@@ -523,7 +534,7 @@ function startH264Worker(config) {
     els.canvas.classList.add("hidden");
     els.video.classList.add("hidden");
     const off = el.transferControlToOffscreen();
-    const worker = new Worker("h264worker.js?v=84");
+    const worker = new Worker("h264worker.js?v=91");
     state.worker = worker;
     worker.onmessage = onWorkerMessage;
     worker.postMessage({ type: "canvas", canvas: off }, [off]);
@@ -708,6 +719,10 @@ function sendInput(ev) {
     return;
   }
   if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "input", ev }));
+}
+
+function sendLog(msg) {
+  try { if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "log", msg })); } catch (_) {}
 }
 
 function normalized(e) {
@@ -942,6 +957,7 @@ function syncModeSelect() {
 
 function setMode(target) {
   if (target === currentMode()) { syncModeSelect(); return; }
+  sendLog("setMode: " + target);
   if (target === "webrtc") {
     state.mode = "webrtc";
     teardownDecoder();
@@ -983,11 +999,11 @@ if (els.relayChk) {
 /* ----------------------------- 直连码率 ----------------------------- */
 if (els.bitrateSel) {
   try {
-    const saved = localStorage.getItem("rc_direct_bitrate");
+    const saved = localStorage.getItem("rc_bitrate");
     if (saved && Array.prototype.some.call(els.bitrateSel.options, (o) => o.value === saved)) els.bitrateSel.value = saved;
   } catch (_) {}
   els.bitrateSel.addEventListener("change", () => {
-    try { localStorage.setItem("rc_direct_bitrate", els.bitrateSel.value); } catch (_) {}
+    try { localStorage.setItem("rc_bitrate", els.bitrateSel.value); } catch (_) {}
     if (state.mode === "webrtc") sendBitrate();
     const opt = els.bitrateSel.options[els.bitrateSel.selectedIndex];
     toast((state.forceRelay ? "中继码率：" : "直连码率：") + (opt ? opt.textContent : els.bitrateSel.value));
@@ -1005,7 +1021,8 @@ function applyQuality(width) {
 }
 els.qualitySel.addEventListener("change", () => applyQuality());
 
-els.disconnectBtn.addEventListener("click", () => location.reload());
+els.disconnectBtn.addEventListener("click", () => { sendLog("disconnect: reload"); location.reload(); });
+window.addEventListener("beforeunload", () => sendLog("beforeunload"));
 
 /* ----------------------------- 媒体看门狗 ----------------------------- */
 setInterval(() => {
@@ -1021,8 +1038,17 @@ setInterval(() => {
   }
   if (state.mode !== "webrtc") return;
   const ref = state.lastFrameAt || state.webrtcStartAt;
-  if (ref && performance.now() - ref > 10000) {
-    enableFallback("WebRTC 无画面，已自动切换兼容模式");
+  if (ref && performance.now() - ref > 20000) {
+    if (state.webrtcStallRetries < 1) {
+      // 先重连一次 WebRTC（给 REMB 重新爬升的机会），不要一卡就切硬解码
+      state.webrtcStallRetries++;
+      state.lastFrameAt = performance.now();
+      setStatus("WebRTC 无画面，重连中…", "warn");
+      sendLog("webrtc stall -> reconnect");
+      setupWebRTC({ forceRelay: state.forceRelay });
+    } else {
+      enableFallback("WebRTC 无画面，已自动切换兼容模式");
+    }
   }
 }, 2000);
 
@@ -1038,6 +1064,18 @@ setInterval(() => {
   if (state.mode === "fallback" && state.fallbackCodec === "h264") {
     const q = state.decoder ? state.decoder.decodeQueueSize : 0;
     ws.send(JSON.stringify({ type: "rate", q, rx }));
+  }
+  // WebRTC：把浏览器侧接收统计上报给服务端（排查“发得出去、收不到”）
+  if (state.mode === "webrtc" && state.pc && state.ws && state.ws.readyState === 1) {
+    state.pc.getStats().then((st) => {
+      let fr = 0, fd = 0, lost = 0, bytes = 0;
+      st.forEach((r) => {
+        if (r.type === "inbound-rtp" && r.kind === "video") {
+          fr = r.framesReceived; fd = r.framesDecoded; lost = r.packetsLost; bytes = r.bytesReceived;
+        }
+      });
+      try { state.ws.send(JSON.stringify({ type: "rxstat", fr, fd, lost, bytes })); } catch (_) {}
+    }).catch(() => {});
   }
   if (ws === iw) {
     state.inputPingSent = performance.now();
@@ -1087,7 +1125,7 @@ setInterval(async () => {
 
 /* ----------------------------- 诊断条 ----------------------------- */
 setInterval(() => {
-  if (els.build) els.build.textContent = "v84";
+  if (els.build) els.build.textContent = "v91";
   if (!els.diag) return;
   const age = state.lastFrameAt ? ((performance.now() - state.lastFrameAt) / 1000).toFixed(1) : "-";
   let lat = 0;

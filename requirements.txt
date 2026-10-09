@@ -1,15 +1,16 @@
-# 被控机 Agent 运行依赖
+# 被控机 Agent 运行依赖（Windows，Python 3.9+）
 #
-# 安装（务必加 --only-binary=:all:，否则 pip 可能尝试从源码编译 av 而失败）：
-#   C:\path\to\python-env\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
+# 一般无需手动安装：scripts\start_all.ps1 首次运行会自动创建 .venv 并安装本文件。
+# 手动安装（务必加 --only-binary=:all:，否则 pip 可能尝试从源码编译 av 而失败）：
+#   python -m pip install --only-binary=:all: -r requirements.txt
 #
-# 通过 scripts\start_agent.ps1 自动在 D 盘 Anaconda 下创建（Python 3.13），
-# 版本为在 Windows + Python 3.13 上实测可用的组合（numpy 已放宽至 <3）。
+# 版本为 Windows + NVIDIA 显卡上实测可用的组合。
 
 av==14.2.0            # 提供 h264_nvenc (NVIDIA 硬件编码)
 aiortc==1.13.0        # WebRTC 服务端
 aiohttp==3.13.5       # 本地 Web / 信令服务
-numpy>=1.26,<3        # dxcam 需要（3.13 无 numpy<2 轮子）
+numpy>=1.26,<3        # dxcam / opencv 需要
+opencv-python>=4.8    # 图像缩放等（cv2）
 mss==10.2.0           # 备用截屏（DXGI 不可用时）
 dxcam==0.0.5          # DXGI Desktop Duplication 高速截屏
-cryptography>=44.0.0  # 安全随机 / 令牌
+cryptography>=44.0.0  # aiortc 的 DTLS 依赖（非直接 import，但运行必需）

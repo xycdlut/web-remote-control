@@ -2,14 +2,13 @@
 #
 # 用法（普通窗口即可，脚本会自动弹 UAC 提权）：
 #   powershell -ExecutionPolicy Bypass -File scripts\restart_agent.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\restart_agent.ps1 -Port 8443
-#   powershell -ExecutionPolicy Bypass -File scripts\restart_agent.ps1 -AlsoFrpc
+#   powershell -ExecutionPolicy Bypass -File scripts\restart_agent.ps1 -Port 8443 -PyExe <python.exe>
 #
 # 说明：Agent 通常以管理员身份运行，结束其进程需要管理员权限；
 #       若当前不是管理员，本脚本会自动提权重启自己。
 param(
     [int]$Port = 8443,
-    [switch]$AlsoFrpc
+    [string]$PyExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +18,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Host "[*] 需要管理员权限，正在提权（请在 UAC 弹窗点“是”）..." -ForegroundColor Yellow
     $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-Port", $Port)
-    if ($AlsoFrpc) { $argList += "-AlsoFrpc" }
+    if ($PyExe) { $argList += @("-PyExe", "`"$PyExe`"") }
     Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs
     exit
 }
@@ -27,6 +26,7 @@ if (-not $isAdmin) {
 $root = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $root "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+. (Join-Path $PSScriptRoot "_env.ps1")
 
 # ---------- 1) 结束正在运行的 Agent ----------
 $killed = 0
@@ -61,26 +61,14 @@ if ($killed -eq 0) { Write-Host "[=] 未发现正在运行的 Agent" }
 Start-Sleep -Seconds 2
 
 # ---------- 2) 启动 Agent ----------
-$envDir = "C:\path\to\python-env"
-$py = Join-Path $envDir "python.exe"
-if (-not (Test-Path $py)) { throw "找不到 Python：$py" }
-# conda 环境未激活时需手动把 Library\bin 加入 PATH，否则 python 的 ssl 模块不可用
-$env:PATH = "$envDir;$envDir\Library\mingw-w64\bin;$envDir\Library\usr\bin;$envDir\Library\bin;$envDir\Scripts;$envDir\bin;$env:PATH"
-
+$py = Prepare-RcPython -PyExe $PyExe
 Start-Process -FilePath $py -ArgumentList @((Join-Path $root "agent\main.py")) `
     -RedirectStandardOutput (Join-Path $logDir "agent.out") `
     -RedirectStandardError (Join-Path $logDir "agent.err") `
     -WorkingDirectory $root -WindowStyle Hidden
 Write-Host "[*] Agent 已重新启动" -ForegroundColor Cyan
 
-# ---------- 3) 可选：同时重启 frpc ----------
-if ($AlsoFrpc) {
-    Get-Process frpc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-    & (Join-Path $root "scripts\start_all.ps1")
-}
-
-# ---------- 4) 校验 ----------
+# ---------- 3) 校验 ----------
 Start-Sleep -Seconds 3
 if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
     Write-Host "[OK] Agent 正在监听 $Port" -ForegroundColor Green

@@ -11,7 +11,7 @@ from aiortc.codecs.h264 import H264Encoder
 
 logger = logging.getLogger(__name__)
 
-SETTINGS = {"fps": 30, "bitrate": 8_000_000, "max_bitrate": 50_000_000}
+SETTINGS = {"fps": 30, "bitrate": 8_000_000, "max_bitrate": 50_000_000, "min_bitrate": 300_000}
 
 
 def configure(fps: int = None, bitrate: int = None):
@@ -51,6 +51,7 @@ class NvencH264Encoder(H264Encoder):
         super().__init__()
         self.fps = int(fps or SETTINGS["fps"])
         self._target_bitrate = int(bitrate or SETTINGS["bitrate"])
+        self._min_bitrate = int(SETTINGS.get("min_bitrate", 300_000))
         self._max_bitrate = int(SETTINGS.get("max_bitrate", 50_000_000))
         self._codec_name = "h264_nvenc"
         self.codec = None
@@ -64,8 +65,8 @@ class NvencH264Encoder(H264Encoder):
 
     @target_bitrate.setter
     def target_bitrate(self, value: int) -> None:
-        # REMB from the browser can ramp this up; never exceed the configured cap.
-        self._target_bitrate = max(300_000, min(int(value), self._max_bitrate))
+        # REMB from the browser can ramp this; clamp within [min, max].
+        self._target_bitrate = max(self._min_bitrate, min(int(value), self._max_bitrate))
 
     def _encode_frame(self, frame, force_keyframe):
         if self.codec is not None and (
@@ -194,18 +195,22 @@ def _patched_get_encoder(codec):
     return _original_get_encoder(codec)
 
 
-def set_target_bitrate(bps: int, max_bps=None) -> None:
-    """运行时调整 WebRTC 视频编码码率（中继降码率用）。
-    max_bps 同时设为上限，防止浏览器 REMB 把码率重新拉高导致中继链路拥塞。"""
+def set_target_bitrate(bps: int, max_bps=None, min_bps=None) -> None:
+    """运行时调整 WebRTC 视频编码码率。
+    max_bps/min_bps 同时设为上/下限，防止 REMB 把码率拉到过高或踩到地板（中继防低码率死锁）。"""
     bps = max(300_000, min(int(bps), 50_000_000))
     SETTINGS["bitrate"] = bps
     if max_bps:
         SETTINGS["max_bitrate"] = max(300_000, min(int(max_bps), 50_000_000))
+    if min_bps:
+        SETTINGS["min_bitrate"] = max(100_000, min(int(min_bps), 50_000_000))
     enc = _last_encoder
     if enc is not None:
         try:
             if max_bps:
                 enc._max_bitrate = SETTINGS["max_bitrate"]
+            if min_bps:
+                enc._min_bitrate = SETTINGS["min_bitrate"]
             enc.target_bitrate = bps
         except Exception:
             pass

@@ -27,3 +27,6 @@ node_modules/
 .vscode/
 package.json
 package-lock.json
+
+# 本机私有覆盖（Python 解释器路径等，勿提交）
+scripts/local.ps1

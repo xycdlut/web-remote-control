@@ -1,9 +1,10 @@
 ﻿# 一键启动被控机 Agent + frpc（都后台隐藏运行）
-# 首次运行会自动：创建 conda 环境 → 安装 Python 依赖 → 下载 frpc。
+# 首次运行会自动：准备 Python 环境 → 安装依赖 → 下载 frpc。
+# Python 解释器解析优先级：-PyExe 参数 > 环境变量 RC_PY > 项目内 .venv > PATH 上的 python。
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1 -ServerAddr <服务器IP> -Token <FRP令牌>
-#   可选： -ServerPort 7000 -LocalPort 8443 -RemotePort 8443 -Fps 60 -Bitrate 8000000 -Monitor 0 -Public
+# 可选： -ServerPort 7000 -LocalPort 8443 -RemotePort 8443 -Fps 60 -Bitrate 8000000 -Monitor 0 -Public -PyExe <python.exe>
 param(
     [Parameter(Mandatory = $true)][string]$ServerAddr,
     [Parameter(Mandatory = $true)][string]$Token,
@@ -13,29 +14,29 @@ param(
     [int]$Fps = 0,
     [int]$Bitrate = 0,
     [int]$Monitor = -1,
-    [switch]$Public
+    [switch]$Public,
+    [string]$PyExe = ""
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $root "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+. (Join-Path $PSScriptRoot "_env.ps1")
 
-# ---------- 1) Agent 运行环境（首次自动创建并装依赖） ----------
-$conda = "conda.exe"
-$envDir = "C:\path\to\python-env"
-$py = Join-Path $envDir "python.exe"
-if (-not (Test-Path $py)) {
-    Write-Host "[*] 首次运行：创建 conda 环境 remote_control ..." -ForegroundColor Cyan
-    & $conda create -n remote_control python=3.9.13 -y --override-channels -c https://mirror.nju.edu.cn/anaconda/pkgs/main
-    if (-not $?) { throw "conda 环境创建失败" }
+# ---------- 1) Python 环境（首次自动创建 .venv 并装依赖） ----------
+$venvPy = Join-Path $root ".venv\Scripts\python.exe"
+if (-not $PyExe -and -not $env:RC_PY -and -not (Test-Path $venvPy)) {
+    $base = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+    if (-not $base) { $base = (Get-Command py.exe -ErrorAction SilentlyContinue).Source }
+    if ($base) {
+        Write-Host "[*] 首次运行：创建项目内虚拟环境 .venv ..." -ForegroundColor Cyan
+        & $base -m venv (Join-Path $root ".venv")
+    }
 }
-# conda 环境未激活时需手动把 Library\bin 加入 PATH，否则 python 的 ssl 模块不可用
-$env:PATH = "$envDir;$envDir\Library\mingw-w64\bin;$envDir\Library\usr\bin;$envDir\Library\bin;$envDir\Scripts;$envDir\bin;$env:PATH"
-if (-not (Test-Path (Join-Path $envDir "Lib\site-packages\aiortc"))) {
-    Write-Host "[*] 首次运行：安装 Python 依赖 ..." -ForegroundColor Cyan
-    & $py -m pip install --only-binary=:all: -r (Join-Path $root "requirements.txt")
-    if (-not $?) { throw "依赖安装失败" }
+$py = Prepare-RcPython -PyExe $PyExe
+if (-not (Test-RcDeps -PyExe $py)) {
+    Install-RcDeps -PyExe $py -Root $root
 }
 
 # ---------- 2) Agent ----------
