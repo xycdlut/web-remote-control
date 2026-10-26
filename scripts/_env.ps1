@@ -30,13 +30,28 @@ function Prepare-RcPython {
 
 function Test-RcDeps {
     param([string]$PyExe)
-    & $PyExe -c "import aiortc, av, cv2" 2>$null | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    # 注意：导入 aio 依赖时可能向 stderr 输出警告；$ErrorActionPreference='Stop' 会把原生 stderr 当致命错误，
+    # 这里临时改为 Continue 并抑制输出/警告，避免“误判依赖缺失/启动失败”。
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $PyExe -W ignore -c "import aiortc, av, cv2" *> $null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $eap
+    }
 }
 
 function Install-RcDeps {
     param([string]$PyExe, [string]$Root)
     Write-Host "[*] 安装 Python 依赖（首次约几分钟）..." -ForegroundColor Cyan
-    & $PyExe -m pip install --only-binary=:all: -r (Join-Path $Root "requirements.txt")
-    if (-not $?) { throw "依赖安装失败" }
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $PyExe -m pip install --only-binary=:all: -r (Join-Path $Root "requirements.txt")
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    if ($code -ne 0) { throw "依赖安装失败" }
 }

@@ -31,7 +31,8 @@ if (-not $PyExe -and -not $env:RC_PY -and -not (Test-Path $venvPy)) {
     if (-not $base) { $base = (Get-Command py.exe -ErrorAction SilentlyContinue).Source }
     if ($base) {
         Write-Host "[*] 首次运行：创建项目内虚拟环境 .venv ..." -ForegroundColor Cyan
-        & $base -m venv (Join-Path $root ".venv")
+        $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        try { & $base -m venv (Join-Path $root ".venv") } finally { $ErrorActionPreference = $eap }
     }
 }
 $py = Prepare-RcPython -PyExe $PyExe
